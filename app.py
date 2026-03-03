@@ -431,12 +431,15 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
+    wav_dirs = set(str(Path(f).parent) for f in FILENAMES if os.path.exists(f))
+
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
         show_error=True,
         ssr_mode=False,
+        allowed_paths=list(wav_dirs),
         theme=gr.themes.Base(
             primary_hue=gr.themes.colors.teal,
             secondary_hue=gr.themes.colors.blue,
