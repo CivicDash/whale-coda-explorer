@@ -13,13 +13,14 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 import gradio as gr
 import scipy.io.wavfile as wavfile
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
-from io import BytesIO
+
 from coda_detector import detect_codas, codas_to_dict, DetectorParams, teager_kaiser
 
 DATA_DIR = Path(__file__).parent / "exploration_output"
@@ -45,52 +46,23 @@ SPECTRAL_PALETTE = [
 for i in range(N_CLUSTERS):
     CLUSTER_COLORS[i] = SPECTRAL_PALETTE[i % len(SPECTRAL_PALETTE)]
 
-CODA_DF = pd.DataFrame({
-    'umap_1': EMBEDDINGS_2D[:, 0],
-    'umap_2': EMBEDDINGS_2D[:, 1],
-    'cluster': [f"Cluster {c}" if c != -1 else "Bruit" for c in CLUSTER_LABELS],
-    'idx': list(range(len(CLUSTER_LABELS))),
-    'fichier': [Path(f).stem for f in FILENAMES],
-})
-
-CLUSTER_COLOR_MAP = {"Bruit": "#CCCCCC"}
-for i in range(N_CLUSTERS):
-    CLUSTER_COLOR_MAP[f"Cluster {i}"] = SPECTRAL_PALETTE[i % len(SPECTRAL_PALETTE)]
 
 
-def get_filtered_df(selected_cluster="Tous"):
-    """Return filtered DataFrame for the scatter plot."""
-    if selected_cluster == "Tous":
-        return CODA_DF.reset_index(drop=True)
-    return CODA_DF[CODA_DF['cluster'] == selected_cluster].reset_index(drop=True)
+def _parse_click_value(val):
+    """Extract index from 'idx_timestamp' or plain 'idx' string."""
+    val = val.strip()
+    if '_' in val:
+        val = val.split('_')[0]
+    return int(val)
 
 
-def on_point_click(cluster_choice, evt: gr.SelectData):
-    """Handle click on a scatter point — load audio + spectrogram."""
+def on_plotly_click(clicked_idx_str):
+    """Handle click on a Plotly scatter point via JS bridge."""
     try:
-        idx = None
-        current_df = get_filtered_df(cluster_choice)
+        if not clicked_idx_str or clicked_idx_str.strip() == "":
+            return gr.update(), None, None, "Cliquez sur un point de la carte."
 
-        if hasattr(evt, 'index') and evt.index is not None:
-            row_pos = evt.index
-            if isinstance(row_pos, (list, tuple)):
-                row_pos = row_pos[0]
-            row_pos = int(row_pos)
-            if 0 <= row_pos < len(current_df):
-                idx = int(current_df.iloc[row_pos]['idx'])
-
-        if idx is None and hasattr(evt, 'value'):
-            val = evt.value
-            if isinstance(val, dict) and 'idx' in val:
-                idx = int(val['idx'])
-            elif isinstance(val, (list, tuple)) and len(val) >= 2:
-                x_val, y_val = float(val[0]), float(val[1])
-                dists = (EMBEDDINGS_2D[:, 0] - x_val)**2 + (EMBEDDINGS_2D[:, 1] - y_val)**2
-                idx = int(np.argmin(dists))
-
-        if idx is None:
-            return gr.update(), None, None, f"Selection non reconnue: {evt.value}"
-
+        idx = _parse_click_value(clicked_idx_str)
         if idx < 0 or idx >= len(FILENAMES):
             return gr.update(), None, None, f"Index {idx} hors limites."
 
@@ -116,10 +88,10 @@ def on_point_click(cluster_choice, evt: gr.SelectData):
                 nlabel = "Bruit" if ncid == -1 else f"C{ncid}"
                 info += f"- {Path(FILENAMES[ni]).stem} [{nlabel}] (dist: {dist:.4f})\n"
 
-        return gr.update(value=str(idx)), filepath, specfig, info
+        return filepath, specfig, info
 
     except Exception as e:
-        return gr.update(), None, None, f"Erreur lors du clic: {e}"
+        return None, None, f"Erreur: {e}"
 
 
 def get_cluster_stats():
@@ -210,6 +182,85 @@ def build_scatter_plot(selected_cluster="Tous"):
     return fig
 
 
+def plotly_to_interactive_html(fig, target_elem_id, plot_div_id="plotly-scatter"):
+    """Convert a Plotly figure to HTML with click-to-textbox JS bridge.
+    
+    When a point is clicked, the JS extracts the customdata (index) and
+    injects it into a Gradio Textbox identified by its elem_id.
+    """
+    plot_html = pio.to_html(
+        fig,
+        full_html=False,
+        include_plotlyjs='cdn',
+        div_id=plot_div_id,
+        config={'displayModeBar': True, 'scrollZoom': True},
+    )
+
+    click_js = f"""
+    <script>
+    (function() {{
+        function findTarget() {{
+            var el = document.getElementById('{target_elem_id}');
+            if (el) {{
+                var inp = el.querySelector('textarea') || el.querySelector('input');
+                if (inp) return inp;
+            }}
+            var all = document.querySelectorAll('[id*="{target_elem_id}"]');
+            for (var c of all) {{
+                var inp = c.querySelector('textarea') || c.querySelector('input');
+                if (inp) return inp;
+            }}
+            return null;
+        }}
+
+        function setGradioValue(el, val) {{
+            var setter = Object.getOwnPropertyDescriptor(
+                Object.getPrototypeOf(el), 'value'
+            );
+            if (setter && setter.set) {{
+                setter.set.call(el, val);
+            }} else {{
+                el.value = val;
+            }}
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+
+        function attachClickHandler() {{
+            var plotEl = document.getElementById('{plot_div_id}');
+            if (!plotEl) return false;
+
+            plotEl.on('plotly_click', function(data) {{
+                if (!data || !data.points || data.points.length === 0) return;
+                var idx = data.points[0].customdata;
+                if (idx === undefined || idx === null) return;
+
+                var payload = String(idx) + '_' + Date.now();
+                var target = findTarget();
+                if (target) {{
+                    setGradioValue(target, payload);
+                }} else {{
+                    setTimeout(function() {{
+                        var t = findTarget();
+                        if (t) setGradioValue(t, payload);
+                    }}, 500);
+                }}
+            }});
+            return true;
+        }}
+
+        if (!attachClickHandler()) {{
+            var retries = 0;
+            var iv = setInterval(function() {{
+                if (attachClickHandler() || retries++ > 20) clearInterval(iv);
+            }}, 200);
+        }}
+    }})();
+    </script>
+    """
+    return f'<div style="width:100%">{plot_html}{click_js}</div>'
+
+
 def make_spectrogram(filepath):
     """Genere un spectrogramme pour un fichier WAV."""
     try:
@@ -293,29 +344,11 @@ def get_cluster_summary(cluster_id):
     return summary
 
 
-def on_cluster_select(cluster_choice):
-    """Callback quand l'utilisateur choisit un filtre cluster."""
-    filtered_df = get_filtered_df(cluster_choice)
-
-    if cluster_choice == "Tous":
-        summary = "### Vue d'ensemble\n\n"
-        summary += f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
-        summary += f"- **Clusters decouverts**: {N_CLUSTERS}\n"
-        summary += f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
-        summary += "Cliquez sur un point de la carte pour ecouter le coda."
-    elif cluster_choice == "Bruit":
-        summary = get_cluster_summary(-1)
-    else:
-        cid = int(cluster_choice.replace("Cluster ", ""))
-        summary = get_cluster_summary(cid)
-
-    return filtered_df, summary
-
 
 def on_coda_select(cluster_choice, coda_index):
     """Charge un coda specifique par son index."""
     try:
-        idx = int(coda_index)
+        idx = _parse_click_value(coda_index)
         if idx < 0 or idx >= len(FILENAMES):
             return None, None, f"Index {idx} hors limites (0-{len(FILENAMES)-1})"
 
@@ -406,6 +439,26 @@ def build_distribution_chart():
     return fig
 
 
+WHALE_NAMES = {
+    "5130": ("Calypso", "La discrete de la famille F — seulement 28 codas enregistres, prefere le rythme 1+1+3"),
+    "5151": ("Triton", "Bavard de l'unite T — adore les longues sequences 5R2, jusqu'a 6 clics en moyenne"),
+    "5560": ("Ondine", "Polyglotte de la famille F — maitrise 5R1, 1+1+3, et au moins 6 types de codas"),
+    "5561": ("Echo", "La fidele — 77% de ses codas sont du type 1+1+3, le dialecte de la famille F"),
+    "5562": ("Nereid", "Specialiste du 5R1 — 87% de ses vocalisations suivent ce rythme precis"),
+    "5563": ("Corail", "La jeune exploratrice — peu de codas mais une grande diversite de types"),
+    "5703": ("Poseidon", "Le chanteur aux longues phrases — 7 clics en moyenne, maitre des codas irreguliers"),
+    "5722": ("Aurora", "La plus prolifique — 281 codas ! Signature unique avec les rythmes 4D et 7D"),
+    "5727": ("Vega", "Heritiere du dialecte familial — 64% de 1+1+3, le coeur de l'identite F"),
+    "5978": ("Fidele", "La constante de l'unite J — 98% de 1+1+3, une voix qui ne varie presque jamais"),
+    "5979": ("Melody", "La versatile — melange 1+1+3 et 5R1, un pont entre deux dialectes"),
+    "5981": ("Harmonie", "Pure unite J — 99% de 1+1+3, l'essence meme du dialecte de son clan"),
+    "5987": ("Rythme", "L'equilibriste — partage ses codas entre 5R1 et 1+1+3, deux voix en une"),
+    "59871": ("Petit Flot", "Le bebe — seulement 3 codas enregistres, balbutie encore en 4R1"),
+    "6035": ("Saphir", "La diplomate de l'unite T — parle 1+1+3 comme les J et 5R1 comme les siens"),
+    "6058": ("Sirius", "Voix claire de l'unite T — 64% de 5R1, signature nette et reconnaissable"),
+    "6070/6068": ("Les Jumelles", "Duo inseparable — identite parfois ambigue, coeur de la famille F"),
+}
+
 GERO_DF = None
 GERO_EMBEDDING = None
 if GERO_PATH.exists():
@@ -415,38 +468,105 @@ if GERO_PATH.exists():
     _unit_map = {1: "A", 2: "B", 3: "F", 4: "J", 5: "N", 6: "R", 7: "S", 8: "T", 9: "U"}
     _gero_raw['UnitName'] = _gero_raw['Unit'].map(_unit_map).fillna("?")
     GERO_DF = _gero_raw[_gero_raw['CodaName'] != 'NOISE'].reset_index(drop=True)
+    GERO_DF['WhaleID'] = GERO_DF['WhaleID'].astype(str)
 
     _gero_emb_path = DATA_DIR / 'gero_embedding_2d.npy'
     if _gero_emb_path.exists():
         GERO_EMBEDDING = np.load(_gero_emb_path)
 
 
-def build_gero_scatter_df(color_by="CodaName"):
-    """Build DataFrame for Gero dataset scatter plot."""
+
+
+def build_gero_plotly(color_by="CodaName"):
+    """Build interactive Plotly scatter plot for the Gero dataset."""
     if GERO_DF is None or GERO_EMBEDDING is None:
-        return pd.DataFrame()
+        fig = go.Figure()
+        fig.update_layout(title="Dataset non charge")
+        return fig
 
-    df = pd.DataFrame({
-        'umap_1': GERO_EMBEDDING[:, 0],
-        'umap_2': GERO_EMBEDDING[:, 1],
-        'idx': range(len(GERO_DF)),
-    })
+    title_map = {
+        "CodaName": "Par type de coda",
+        "UnitName": "Par unite sociale",
+        "WhaleID": "Par individu",
+        "Year": "Par annee",
+    }
 
-    if color_by == "CodaName":
-        df['group'] = GERO_DF['CodaName'].values
-    elif color_by == "UnitName":
-        df['group'] = ("Unit " + GERO_DF['UnitName']).values
-    elif color_by == "WhaleID":
-        df['group'] = GERO_DF['WhaleID'].apply(
-            lambda x: f"Whale {x}" if x != 0 else "Non identifie"
+    fig = go.Figure()
+
+    if color_by == "WhaleID":
+        groups = GERO_DF['WhaleID'].apply(
+            lambda x: get_whale_display_name(x) if str(x) != '0' else "Non identifie"
         ).values
+    elif color_by == "UnitName":
+        groups = ("Unit " + GERO_DF['UnitName']).values
     elif color_by == "Year":
-        df['group'] = GERO_DF['Year'].astype(str).values
+        groups = GERO_DF['Year'].astype(str).values
     else:
-        df['group'] = GERO_DF['CodaName'].values
+        groups = GERO_DF[color_by].values
 
-    df['fichier'] = GERO_DF['CodaName'].values
-    return df
+    unique_groups = sorted(set(groups))
+    palette = [
+        "#9E0142", "#D53E4F", "#F46D43", "#FDAE61", "#FEE08B",
+        "#E6F598", "#ABDDA4", "#66C2A5", "#3288BD", "#5E4FA2",
+        "#8073AC", "#B2ABD2", "#D8DAEB", "#FDB863", "#E08214",
+        "#B35806", "#542788", "#998EC3", "#F1A340", "#01665E",
+    ]
+
+    for gi, grp in enumerate(unique_groups):
+        mask = groups == grp
+        indices = np.where(mask)[0]
+
+        hover_texts = []
+        for i in indices:
+            row = GERO_DF.iloc[i]
+            whale_str = get_whale_display_name(row['WhaleID']) if str(row['WhaleID']) != '0' else "Non id."
+            hover_texts.append(
+                f"<b>{grp}</b><br>"
+                f"Type: {row['CodaName']}<br>"
+                f"Unit: {row['UnitName']}<br>"
+                f"Individu: {whale_str}<br>"
+                f"Clics: {row['nClicks']}<br>"
+                f"Index: {i}"
+            )
+
+        fig.add_trace(go.Scatter(
+            x=GERO_EMBEDDING[mask, 0],
+            y=GERO_EMBEDDING[mask, 1],
+            mode='markers',
+            marker=dict(
+                size=6,
+                color=palette[gi % len(palette)],
+                opacity=0.7,
+                line=dict(width=0.3, color='white'),
+            ),
+            name=str(grp),
+            text=hover_texts,
+            hoverinfo='text',
+            customdata=indices.tolist(),
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"Codas de cachalots — {title_map.get(color_by, '')} (Gero et al.)",
+            font=dict(size=16),
+        ),
+        xaxis_title="UMAP 1",
+        yaxis_title="UMAP 2",
+        template="plotly_dark",
+        paper_bgcolor="#1a1a2e",
+        plot_bgcolor="#16213e",
+        font=dict(color="#e0e0e0"),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0.5)",
+            bordercolor="#444",
+            borderwidth=1,
+            font=dict(size=10),
+        ),
+        height=600,
+        margin=dict(l=50, r=30, t=50, b=50),
+        hovermode='closest',
+    )
+    return fig
 
 
 def on_gero_color_change(color_by):
@@ -458,26 +578,9 @@ def on_gero_color_change(color_by):
         "Annee": "Year",
     }
     col = col_map.get(color_by, "CodaName")
-    df = build_gero_scatter_df(col)
-
-    title_map = {
-        "CodaName": "Par type de coda",
-        "UnitName": "Par unite sociale",
-        "WhaleID": "Par individu",
-        "Year": "Par annee",
-    }
-
-    return gr.ScatterPlot(
-        value=df,
-        x="umap_1",
-        y="umap_2",
-        color="group",
-        title=f"Codas de cachalots — {title_map.get(col, '')}",
-        x_title="UMAP 1",
-        y_title="UMAP 2",
-        tooltip="all",
-        height=600,
-    ), get_gero_summary(col)
+    fig = build_gero_plotly(col)
+    html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
+    return html, get_gero_summary(col)
 
 
 def get_gero_summary(color_by="CodaName"):
@@ -489,7 +592,7 @@ def get_gero_summary(color_by="CodaName"):
     md += f"- **Codas**: {len(GERO_DF)}\n"
     md += f"- **Types**: {GERO_DF['CodaName'].nunique()}\n"
     md += f"- **Unites sociales**: {GERO_DF['Unit'].nunique()}\n"
-    md += f"- **Individus identifies**: {GERO_DF[GERO_DF['WhaleID'] != 0]['WhaleID'].nunique()}\n"
+    md += f"- **Individus identifies**: {GERO_DF[GERO_DF['WhaleID'] != '0']['WhaleID'].nunique()}\n"
     md += f"- **Periode**: {GERO_DF['Year'].min()}-{GERO_DF['Year'].max()}\n\n"
 
     if color_by == "CodaName":
@@ -504,11 +607,12 @@ def get_gero_summary(color_by="CodaName"):
             md += f"- Unit {unit}: {count} codas\n"
     elif color_by == "WhaleID":
         md += "**Individus identifies:**\n"
-        identified = GERO_DF[GERO_DF['WhaleID'] != 0]
+        identified = GERO_DF[GERO_DF['WhaleID'] != '0']
         for wid, count in identified['WhaleID'].value_counts().head(10).items():
             unit = identified[identified['WhaleID'] == wid]['UnitName'].iloc[0]
-            md += f"- Whale {wid} (Unit {unit}): {count} codas\n"
-        unid = (GERO_DF['WhaleID'] == 0).sum()
+            display = get_whale_display_name(wid)
+            md += f"- {display} (Unit {unit}): {count} codas\n"
+        unid = (GERO_DF['WhaleID'] == '0').sum()
         md += f"- Non identifies: {unid}\n"
     elif color_by == "Year":
         md += "**Par annee:**\n"
@@ -519,44 +623,44 @@ def get_gero_summary(color_by="CodaName"):
     return md
 
 
-def on_gero_point_click(color_choice, evt: gr.SelectData):
-    """Handle click on Gero scatter plot."""
+def get_whale_display_name(whale_id):
+    """Return display name for a whale: 'Nom (ID)'."""
+    wid = str(whale_id)
+    if wid in WHALE_NAMES:
+        return f"{WHALE_NAMES[wid][0]} (#{wid})"
+    if wid == "0":
+        return "Non identifie"
+    return f"Whale #{wid}"
+
+
+def on_gero_point_click(clicked_idx_str):
+    """Handle click on Gero scatter plot via JS bridge."""
     if GERO_DF is None:
         return "Dataset non charge."
 
     try:
-        color_map = {
-            "Type de coda": "CodaName",
-            "Unite sociale": "UnitName",
-            "Individu": "WhaleID",
-            "Annee": "Year",
-        }
-        col = color_map.get(color_choice, "CodaName")
-        current_df = build_gero_scatter_df(col)
+        if not clicked_idx_str or clicked_idx_str.strip() == "":
+            return "Cliquez sur un point pour voir ses details."
 
-        idx = None
-        if hasattr(evt, 'index') and evt.index is not None:
-            row_pos = evt.index
-            if isinstance(row_pos, (list, tuple)):
-                row_pos = row_pos[0]
-            row_pos = int(row_pos)
-            if 0 <= row_pos < len(current_df):
-                idx = int(current_df.iloc[row_pos]['idx'])
-
-        if idx is None:
-            return "Selection non reconnue."
+        idx = _parse_click_value(clicked_idx_str)
+        if idx < 0 or idx >= len(GERO_DF):
+            return f"Index {idx} hors limites."
 
         row = GERO_DF.iloc[idx]
         ici_cols = ['ICI1', 'ICI2', 'ICI3', 'ICI4', 'ICI5', 'ICI6', 'ICI7', 'ICI8', 'ICI9']
         icis = [row[c] for c in ici_cols if row[c] > 0]
         icis_str = ", ".join(f"{ici*1000:.0f}ms" for ici in icis)
 
-        whale_str = f"Whale {row['WhaleID']}" if row['WhaleID'] != 0 else "Non identifie"
+        wid = str(row['WhaleID'])
+        whale_display = get_whale_display_name(wid)
+        whale_desc = ""
+        if wid in WHALE_NAMES:
+            whale_desc = f"\n  *{WHALE_NAMES[wid][1]}*"
 
         md = f"### Coda #{row['CodaNumber']}\n\n"
         md += f"- **Type**: {row['CodaName']}\n"
         md += f"- **Unite sociale**: Unit {row['UnitName']}\n"
-        md += f"- **Individu**: {whale_str}\n"
+        md += f"- **Individu**: {whale_display}{whale_desc}\n"
         md += f"- **Clics**: {row['nClicks']}\n"
         md += f"- **Duree**: {row['Length']*1000:.0f} ms\n"
         md += f"- **ICIs**: [{icis_str}]\n"
@@ -565,6 +669,134 @@ def on_gero_point_click(color_choice, evt: gr.SelectData):
         return md
     except Exception as e:
         return f"Erreur: {e}"
+
+
+def build_whale_profile(whale_choice):
+    """Build a full profile for a selected whale."""
+    if GERO_DF is None or GERO_EMBEDDING is None:
+        return "", None
+
+    if not whale_choice or whale_choice == "Tous les individus":
+        fig = build_gero_plotly("WhaleID")
+        html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
+        return "Selectionnez un individu pour voir son profil.", html
+
+    wid = whale_choice.split("#")[-1].rstrip(")")
+    if wid not in GERO_DF['WhaleID'].values:
+        return f"Individu {wid} non trouve.", ""
+
+    sub = GERO_DF[GERO_DF['WhaleID'] == wid]
+    name, desc = WHALE_NAMES.get(wid, (f"Whale {wid}", ""))
+    unit = sub['UnitName'].iloc[0]
+
+    md = f"## {name}\n"
+    md += f"*{desc}*\n\n"
+    md += f"**Identifiant scientifique**: #{wid}\n\n"
+    md += f"**Unite sociale**: Unit {unit}\n\n"
+
+    years = sorted(sub['Year'].unique())
+    year_range = f"{min(years)} - {max(years)}" if len(years) > 1 else str(years[0])
+    md += f"**Periode d'observation**: {year_range} ({len(years)} annee{'s' if len(years) > 1 else ''})\n\n"
+    md += f"**Nombre de codas enregistres**: {len(sub)}\n\n"
+    md += f"**Clics par coda (moyenne)**: {sub['nClicks'].mean():.1f}\n\n"
+    md += f"**Duree moyenne d'un coda**: {sub['Length'].mean()*1000:.0f} ms\n\n"
+
+    md += "### Repertoire vocal\n\n"
+    md += "| Type de coda | Nombre | Proportion |\n"
+    md += "|:------------|-------:|-----------:|\n"
+    for ctype, count in sub['CodaName'].value_counts().items():
+        pct = 100 * count / len(sub)
+        bar = "█" * int(pct / 5)
+        md += f"| {ctype} | {count} | {bar} {pct:.1f}% |\n"
+
+    md += "\n### Activite par annee\n\n"
+    for year in sorted(sub['Year'].unique()):
+        yr_sub = sub[sub['Year'] == year]
+        md += f"- **{year}**: {len(yr_sub)} codas"
+        top = yr_sub['CodaName'].value_counts().head(2)
+        types_str = ", ".join(f"{t}({c})" for t, c in top.items())
+        md += f" — {types_str}\n"
+
+    family = GERO_DF[(GERO_DF['UnitName'] == unit) & (GERO_DF['WhaleID'] != '0') & (GERO_DF['WhaleID'] != wid)]
+    if len(family) > 0:
+        relatives = family['WhaleID'].unique()
+        md += f"\n### Famille (Unit {unit})\n\n"
+        for rel_wid in sorted(relatives, key=str):
+            rel_name = get_whale_display_name(rel_wid)
+            rel_count = (family['WhaleID'] == rel_wid).sum()
+            md += f"- {rel_name}: {rel_count} codas\n"
+
+    # Plotly: highlight this whale's points
+    fig = go.Figure()
+
+    others_mask = GERO_DF['WhaleID'] != wid
+    fig.add_trace(go.Scatter(
+        x=GERO_EMBEDDING[others_mask, 0],
+        y=GERO_EMBEDDING[others_mask, 1],
+        mode='markers',
+        marker=dict(size=4, color='#555', opacity=0.2),
+        name="Autres",
+        hoverinfo='skip',
+    ))
+
+    whale_mask = GERO_DF['WhaleID'] == wid
+    whale_indices = np.where(whale_mask)[0]
+    hover_texts = []
+    for i in whale_indices:
+        row = GERO_DF.iloc[i]
+        hover_texts.append(
+            f"<b>{name}</b><br>"
+            f"Type: {row['CodaName']}<br>"
+            f"Clics: {row['nClicks']}<br>"
+            f"Date: {row['Date'].strftime('%Y-%m-%d')}"
+        )
+
+    palette = {
+        "A": "#D53E4F", "B": "#F46D43", "F": "#66C2A5",
+        "J": "#3288BD", "N": "#FDAE61", "R": "#9E0142",
+        "S": "#5E4FA2", "T": "#FEE08B", "U": "#E6F598",
+    }
+    whale_color = palette.get(unit, "#00FFAA")
+
+    fig.add_trace(go.Scatter(
+        x=GERO_EMBEDDING[whale_mask, 0],
+        y=GERO_EMBEDDING[whale_mask, 1],
+        mode='markers',
+        marker=dict(
+            size=10,
+            color=whale_color,
+            opacity=0.9,
+            line=dict(width=1, color='white'),
+            symbol='circle',
+        ),
+        name=name,
+        text=hover_texts,
+        hoverinfo='text',
+        customdata=whale_indices.tolist(),
+    ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"{name} — {len(sub)} codas dans l'espace UMAP",
+            font=dict(size=16),
+        ),
+        xaxis_title="UMAP 1",
+        yaxis_title="UMAP 2",
+        template="plotly_dark",
+        paper_bgcolor="#1a1a2e",
+        plot_bgcolor="#16213e",
+        font=dict(color="#e0e0e0"),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0.5)",
+            font=dict(size=11),
+        ),
+        height=550,
+        margin=dict(l=50, r=30, t=50, b=50),
+        hovermode='closest',
+    )
+
+    html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
+    return md, html
 
 
 def run_detector(audio_file, det_threshold, snr_threshold):
@@ -713,19 +945,11 @@ def build_app():
             with gr.Tab("Explorer les clusters"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        scatter_plot = gr.ScatterPlot(
-                            value=CODA_DF,
-                            x="umap_1",
-                            y="umap_2",
-                            color="cluster",
-                            color_map=CLUSTER_COLOR_MAP,
-                            title="Carte des codas de cachalots — Espace WhAM",
-                            x_title="UMAP 1",
-                            y_title="UMAP 2",
-                            tooltip="all",
-                            height=650,
-                            label="Carte des codas (cliquez sur un point)",
+                        initial_fig = build_scatter_plot("Tous")
+                        initial_html = plotly_to_interactive_html(
+                            initial_fig, "click_bridge", plot_div_id="main-scatter"
                         )
+                        scatter_html = gr.HTML(value=initial_html)
                     with gr.Column(scale=1):
                         cluster_filter = gr.Dropdown(
                             choices=cluster_choices,
@@ -749,9 +973,13 @@ def build_app():
                 gr.Markdown("---")
                 gr.Markdown("### Ecouter et analyser un coda")
 
+                click_bridge = gr.Textbox(
+                    visible=False, elem_id="click_bridge",
+                )
+
                 with gr.Row():
                     with gr.Column(scale=1):
-                        coda_index = gr.Textbox(
+                        coda_index_input = gr.Textbox(
                             label="Index du coda (0-619)",
                             placeholder="Entrez un index ou cliquez sur la carte...",
                             value="0",
@@ -778,28 +1006,46 @@ def build_app():
                             label="Spectrogramme",
                         )
 
-                scatter_plot.select(
-                    fn=on_point_click,
-                    inputs=[cluster_filter],
-                    outputs=[coda_index, audio_player, spectrogram, coda_info],
+                click_bridge.change(
+                    fn=on_plotly_click,
+                    inputs=[click_bridge],
+                    outputs=[audio_player, spectrogram, coda_info],
                 )
 
+                def on_cluster_filter_change(cluster_choice):
+                    fig = build_scatter_plot(cluster_choice)
+                    html = plotly_to_interactive_html(
+                        fig, "click_bridge", plot_div_id="main-scatter"
+                    )
+                    if cluster_choice == "Tous":
+                        summary = "### Vue d'ensemble\n\n"
+                        summary += f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
+                        summary += f"- **Clusters decouverts**: {N_CLUSTERS}\n"
+                        summary += f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
+                        summary += "Cliquez sur un point de la carte pour ecouter le coda."
+                    elif cluster_choice == "Bruit":
+                        summary = get_cluster_summary(-1)
+                    else:
+                        cid = int(cluster_choice.replace("Cluster ", ""))
+                        summary = get_cluster_summary(cid)
+                    return html, summary
+
                 cluster_filter.change(
-                    fn=on_cluster_select,
+                    fn=on_cluster_filter_change,
                     inputs=[cluster_filter],
-                    outputs=[scatter_plot, cluster_info],
+                    outputs=[scatter_html, cluster_info],
                 )
 
                 load_btn.click(
                     fn=on_coda_select,
-                    inputs=[cluster_filter, coda_index],
+                    inputs=[cluster_filter, coda_index_input],
                     outputs=[audio_player, spectrogram, coda_info],
                 )
 
                 random_btn.click(
                     fn=get_random_coda,
                     inputs=[cluster_filter],
-                    outputs=[coda_index, audio_player, spectrogram, coda_info],
+                    outputs=[coda_index_input, audio_player, spectrogram, coda_info],
                 )
 
             with gr.Tab("Identite des cachalots"):
@@ -808,51 +1054,81 @@ def build_app():
                 Dataset [Gero, Whitehead & Rendell (2015)](https://doi.org/10.5061/dryad.ck4h0) :
                 3876 codas des Caraibes orientales avec identification
                 des individus, unites sociales et types de codas.
-                Cliquez sur un point pour voir les details.
+                Cliquez sur un point ou selectionnez un individu.
                 """)
 
                 if GERO_DF is not None and GERO_EMBEDDING is not None:
                     gero_color_choices = [
                         "Type de coda", "Unite sociale", "Individu", "Annee"
                     ]
+                    whale_choices = ["Tous les individus"]
+                    identified_ids = sorted(
+                        [w for w in GERO_DF['WhaleID'].unique() if w != '0'],
+                        key=str
+                    )
+                    for wid in identified_ids:
+                        whale_choices.append(get_whale_display_name(wid))
 
                     with gr.Row():
                         with gr.Column(scale=3):
-                            gero_scatter = gr.ScatterPlot(
-                                value=build_gero_scatter_df("CodaName"),
-                                x="umap_1",
-                                y="umap_2",
-                                color="group",
-                                title="Codas de cachalots — Projection ICI (Gero et al.)",
-                                x_title="UMAP 1",
-                                y_title="UMAP 2",
-                                tooltip="all",
-                                height=600,
-                                label="Cliquez sur un point",
+                            gero_initial_fig = build_gero_plotly("CodaName")
+                            gero_initial_html = plotly_to_interactive_html(
+                                gero_initial_fig, "gero_click_bridge",
+                                plot_div_id="gero-scatter"
                             )
+                            gero_scatter_html = gr.HTML(value=gero_initial_html)
                         with gr.Column(scale=1):
                             gero_color_by = gr.Dropdown(
                                 choices=gero_color_choices,
                                 value="Type de coda",
                                 label="Colorer par",
                             )
+                            whale_selector = gr.Dropdown(
+                                choices=whale_choices,
+                                value="Tous les individus",
+                                label="Rechercher un individu",
+                            )
                             gero_info = gr.Markdown(
                                 value=get_gero_summary("CodaName"),
+                            )
+                            gero_click_bridge = gr.Textbox(
+                                elem_id="gero_click_bridge",
+                                visible=False,
                             )
                             gero_detail = gr.Markdown(
                                 "Cliquez sur un point pour voir ses details.",
                             )
 
+                    with gr.Row(visible=True):
+                        whale_profile_md = gr.Markdown(
+                            visible=False,
+                        )
+
                     gero_color_by.change(
                         fn=on_gero_color_change,
                         inputs=[gero_color_by],
-                        outputs=[gero_scatter, gero_info],
+                        outputs=[gero_scatter_html, gero_info],
                     )
 
-                    gero_scatter.select(
+                    gero_click_bridge.change(
                         fn=on_gero_point_click,
-                        inputs=[gero_color_by],
+                        inputs=[gero_click_bridge],
                         outputs=[gero_detail],
+                    )
+
+                    def on_whale_select(whale_choice):
+                        md, html = build_whale_profile(whale_choice)
+                        show_profile = whale_choice != "Tous les individus"
+                        return (
+                            html,
+                            gr.update(value=md, visible=show_profile),
+                            md if not show_profile else get_gero_summary("WhaleID"),
+                        )
+
+                    whale_selector.change(
+                        fn=on_whale_select,
+                        inputs=[whale_selector],
+                        outputs=[gero_scatter_html, whale_profile_md, gero_info],
                     )
                 else:
                     gr.Markdown(
