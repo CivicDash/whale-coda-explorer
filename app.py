@@ -451,15 +451,33 @@ def build_gero_scatter_df(color_by="CodaName"):
 
 def on_gero_color_change(color_by):
     """Update scatter plot when color-by changes."""
-    color_map = {
+    col_map = {
         "Type de coda": "CodaName",
         "Unite sociale": "UnitName",
         "Individu": "WhaleID",
         "Annee": "Year",
     }
-    col = color_map.get(color_by, "CodaName")
+    col = col_map.get(color_by, "CodaName")
     df = build_gero_scatter_df(col)
-    return df, get_gero_summary(col)
+
+    title_map = {
+        "CodaName": "Par type de coda",
+        "UnitName": "Par unite sociale",
+        "WhaleID": "Par individu",
+        "Year": "Par annee",
+    }
+
+    return gr.ScatterPlot(
+        value=df,
+        x="umap_1",
+        y="umap_2",
+        color="group",
+        title=f"Codas de cachalots — {title_map.get(col, '')}",
+        x_title="UMAP 1",
+        y_title="UMAP 2",
+        tooltip="all",
+        height=600,
+    ), get_gero_summary(col)
 
 
 def get_gero_summary(color_by="CodaName"):
