@@ -1,0 +1,39 @@
+============================================================
+ANALYSE DES CODAS DE CACHALOTS — PROJET CETI/WhAM
+Date: 3 mars 2026
+Auteur: Claude (avec Kevin)
+============================================================
+
+Nombre de codas analysees: 620
+Dimensions des embeddings: 1280
+Couche du transformer utilisee: 10/16
+Methode de clustering: UMAP + HDBSCAN
+
+Clusters trouves: 15
+Points bruit: 14
+
+  Bruit (non classe): 14 codas
+  Cluster 0: 12 codas
+  Cluster 1: 33 codas
+  Cluster 2: 14 codas
+  Cluster 3: 40 codas
+  Cluster 4: 66 codas
+  Cluster 5: 127 codas
+  Cluster 6: 41 codas
+  Cluster 7: 27 codas
+  Cluster 8: 32 codas
+  Cluster 9: 11 codas
+  Cluster 10: 58 codas
+  Cluster 11: 45 codas
+  Cluster 12: 26 codas
+  Cluster 13: 51 codas
+  Cluster 14: 23 codas
+
+Ces clusters pourraient correspondre a:
+  - Differentes unites sociales de cachalots
+  - Differents types de codas (rythme, tempo)
+  - Differents contextes comportementaux
+  - Differentes conditions d'enregistrement
+
+Une investigation plus poussee avec des annotations
+est necessaire pour valider ces hypotheses.
