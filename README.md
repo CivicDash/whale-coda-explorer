@@ -71,6 +71,25 @@ L'app permet de :
 - Ecouter n'importe quel coda directement dans le navigateur
 - Voir le spectrogramme et la forme d'onde
 - Trouver les 5 voisins les plus proches dans l'espace WhAM
+- **Detecter automatiquement les codas** dans un fichier WAV (onglet "Detecteur")
+
+### Detecteur de codas (Python)
+
+Portage en Python du [Coda-detector](https://github.com/Project-CETI/Coda-detector) MATLAB de Project CETI. Le pipeline :
+
+1. **Teager-Kaiser Energy Operator (TKEO)** — rehausse les transitoires impulsifs (clics)
+2. **Selection par SNR** — garde les clics au-dessus d'un seuil de rapport signal/bruit
+3. **Estimation IPI** — mesure l'intervalle inter-pulse (structure multipulse du spermaceti)
+4. **Matrice de similarite** — correlation croisee, amplitude, IPI
+5. **Clustering par graphe** — groupe les clics en codas par coherence des ICIs
+
+```bash
+# En ligne de commande
+python coda_detector.py mon_enregistrement.wav
+
+# Ou via l'app web (onglet "Detecteur de codas")
+python app.py
+```
 
 ### Extraction des embeddings
 
@@ -88,6 +107,7 @@ whale-coda-explorer/
 ├── README.md
 ├── requirements.txt
 ├── app.py                    # App web interactive (Gradio)
+├── coda_detector.py          # Detecteur de codas (port Python du MATLAB CETI)
 ├── explore_codas.py          # Script d'extraction et clustering
 ├── download_dswp.py          # Telechargement du dataset DSWP
 └── exploration_output/       # Resultats de l'analyse
@@ -103,13 +123,14 @@ whale-coda-explorer/
 ## Prerequis
 
 - Python 3.9+
-- GPU NVIDIA avec CUDA (teste sur RTX 2070, 8 Go VRAM)
-- ~5 Go d'espace disque (pour les poids du modele WhAM)
+- GPU NVIDIA avec CUDA (pour l'extraction d'embeddings ; le detecteur et l'app web n'en ont pas besoin)
+- ~5 Go d'espace disque (pour les poids du modele WhAM, si extraction)
 
 ## Credits et remerciements
 
 - **[Project CETI](https://www.projectceti.org/)** — Pour WhAM, le dataset DSWP, et leur travail extraordinaire sur la communication des cachalots
 - **[WhAM: Towards A Translative Model of Sperm Whale Vocalization](https://arxiv.org/abs/2512.02206)** — Paradise et al., NeurIPS 2025
+- **[Automatic Detection and Annotation of Sperm Whale Codas](https://arxiv.org/abs/2407.17119)** — Project CETI, 2024 (algorithme original du Coda-detector)
 - **[Civis-Consilium](https://civis-consilium.org/)** — Association europeenne pour le renforcement du lien entre citoyens et institutions, qui heberge ce projet comme outil open source de mediation entre humains et nature
 
 ## A propos

@@ -19,6 +19,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 from io import BytesIO
+from coda_detector import detect_codas, codas_to_dict, DetectorParams, teager_kaiser
 
 DATA_DIR = Path(__file__).parent / "exploration_output"
 EMBEDDINGS_2D = np.load(DATA_DIR / "embedding_2d.npy")
@@ -328,6 +329,132 @@ def build_distribution_chart():
     return fig
 
 
+def run_detector(audio_file, det_threshold, snr_threshold):
+    """Run coda detector on uploaded audio file."""
+    if audio_file is None:
+        return None, "Veuillez uploader un fichier audio WAV."
+
+    params = DetectorParams(
+        detection_threshold=det_threshold,
+        snr_threshold=snr_threshold,
+    )
+
+    codas = detect_codas(audio_file, params=params)
+    results = codas_to_dict(codas)
+
+    fig = make_detection_plot(audio_file, codas)
+
+    if not results:
+        return fig, "### Aucun coda detecte\n\nEssayez de baisser les seuils de detection."
+
+    md = f"### {len(results)} coda(s) detecte(s)\n\n"
+    md += "| # | Clics | Debut (s) | Duree (ms) | ICIs (ms) | IPI moy. (ms) | SNR moy. |\n"
+    md += "|---|-------|-----------|------------|-----------|---------------|----------|\n"
+    for r in results:
+        icis_str = ", ".join(f"{ici*1000:.0f}" for ici in r['icis'])
+        md += (f"| {r['coda_id']} | {r['n_clicks']} | {r['start_time']:.2f} | "
+               f"{r['duration']*1000:.0f} | {icis_str} | "
+               f"{r['mean_ipi']:.1f} | {r['mean_snr']:.0f} dB |\n")
+
+    return fig, md
+
+
+def make_detection_plot(audio_path, codas):
+    """Visualize detected codas on the audio waveform."""
+    try:
+        sr, data = wavfile.read(audio_path)
+        if data.ndim > 1:
+            data = data[:, 0]
+        data = data.astype(np.float64)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 7),
+                                 gridspec_kw={'height_ratios': [2, 1, 2]})
+        fig.patch.set_facecolor('#1a1a2e')
+
+        t = np.arange(len(data)) / sr
+
+        axes[0].plot(t, data, color='#66C2A5', linewidth=0.3, alpha=0.7)
+        axes[0].set_ylabel("Amplitude", color='#e0e0e0', fontsize=9)
+        axes[0].set_title("Signal audio + codas detectes", color='#e0e0e0',
+                          fontsize=12, fontweight='bold')
+
+        colors = ['#D53E4F', '#F46D43', '#FDAE61', '#66C2A5', '#3288BD',
+                  '#9E0142', '#5E4FA2', '#ABDDA4', '#FEE08B', '#E6F598']
+        for i, coda in enumerate(codas):
+            color = colors[i % len(colors)]
+            for click in coda.clicks:
+                axes[0].axvline(click.time, color=color, alpha=0.7,
+                                linewidth=1.5, linestyle='-')
+            if coda.clicks:
+                t_start = min(c.time for c in coda.clicks)
+                t_end = max(c.time for c in coda.clicks)
+                axes[0].axvspan(t_start - 0.01, t_end + 0.01,
+                                alpha=0.15, color=color)
+                axes[0].text(t_start, axes[0].get_ylim()[1] * 0.9,
+                             f"C{i+1}", color=color, fontsize=8, fontweight='bold')
+
+        from scipy.signal import butter, filtfilt
+        nyq = sr / 2
+        low = max(2000 / nyq, 0.001)
+        high = min(24000 / nyq, 0.999)
+        b, a = butter(4, [low, high], btype='band')
+        filtered = filtfilt(b, a, data / (np.max(np.abs(data)) + 1e-10))
+        tkeo = teager_kaiser(filtered)
+        tkeo = np.maximum(tkeo, 0)
+        tkeo_max = np.max(tkeo)
+        if tkeo_max > 0:
+            tkeo = tkeo / tkeo_max
+        t_tkeo = np.arange(len(tkeo)) / sr
+
+        axes[1].plot(t_tkeo, tkeo, color='#FDB863', linewidth=0.3, alpha=0.8)
+        axes[1].set_ylabel("TKEO", color='#e0e0e0', fontsize=9)
+        axes[1].set_ylim(0, 1.05)
+
+        axes[2].specgram(data, Fs=sr, cmap='inferno', NFFT=512, noverlap=384)
+        axes[2].set_ylabel("Freq (Hz)", color='#e0e0e0', fontsize=9)
+        axes[2].set_xlabel("Temps (s)", color='#e0e0e0', fontsize=9)
+        axes[2].set_ylim(0, min(sr // 2, 12000))
+
+        for i, coda in enumerate(codas):
+            color = colors[i % len(colors)]
+            for click in coda.clicks:
+                axes[2].axvline(click.time, color=color, alpha=0.5,
+                                linewidth=1, linestyle='--')
+
+        for ax in axes:
+            ax.set_facecolor('#16213e')
+            ax.tick_params(colors='#999')
+            for spine in ['bottom', 'left']:
+                ax.spines[spine].set_color('#444')
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            ax.set_xlim(0, t[-1])
+
+        fig.tight_layout()
+        return fig
+    except Exception as e:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        fig.patch.set_facecolor('#1a1a2e')
+        ax.set_facecolor('#16213e')
+        ax.text(0.5, 0.5, f"Erreur: {e}", transform=ax.transAxes,
+                ha='center', va='center', color='#ff6b6b', fontsize=12)
+        return fig
+
+
+def run_detector_on_dataset(coda_index, det_threshold, snr_threshold):
+    """Run detector on a coda from the dataset."""
+    try:
+        idx = int(coda_index)
+        if idx < 0 or idx >= len(FILENAMES):
+            return None, f"Index hors limites (0-{len(FILENAMES)-1})"
+        filepath = FILENAMES[idx]
+        if not os.path.exists(filepath):
+            return None, f"Fichier introuvable: {filepath}"
+        return run_detector(filepath, det_threshold, snr_threshold)
+    except ValueError:
+        return None, "Entrez un index valide."
+
+
 def build_app():
     """Construit l'application Gradio."""
 
@@ -339,89 +466,151 @@ def build_app():
             <h1>Whale Coda Explorer</h1>
             <p>Exploration interactive des vocalisations de cachalots via WhAM (Project CETI)</p>
             <p style="font-size: 0.8em; color: #666;">
-                620 codas analysees · 15 clusters decouverts · Espace d'embeddings WhAM (1280 dim)
+                620 codas analysees · 15 clusters · Detecteur de codas integre
             </p>
         </div>
         """)
 
-        with gr.Row():
-            with gr.Column(scale=3):
-                scatter_plot = gr.Plot(
-                    value=build_scatter_plot(),
-                    label="Carte des codas",
-                )
-            with gr.Column(scale=1):
-                cluster_filter = gr.Dropdown(
-                    choices=cluster_choices,
-                    value="Tous",
-                    label="Filtrer par cluster",
-                )
-                cluster_info = gr.Markdown(
-                    value=(
-                        f"### Vue d'ensemble\n\n"
-                        f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
-                        f"- **Clusters decouverts**: {N_CLUSTERS}\n"
-                        f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
-                        f"Selectionnez un cluster pour voir ses details."
-                    ),
-                )
-                distribution_chart = gr.Plot(
-                    value=build_distribution_chart(),
-                    label="Distribution",
+        with gr.Tabs():
+            with gr.Tab("Explorer les clusters"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        scatter_plot = gr.Plot(
+                            value=build_scatter_plot(),
+                            label="Carte des codas",
+                        )
+                    with gr.Column(scale=1):
+                        cluster_filter = gr.Dropdown(
+                            choices=cluster_choices,
+                            value="Tous",
+                            label="Filtrer par cluster",
+                        )
+                        cluster_info = gr.Markdown(
+                            value=(
+                                f"### Vue d'ensemble\n\n"
+                                f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
+                                f"- **Clusters decouverts**: {N_CLUSTERS}\n"
+                                f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
+                                f"Selectionnez un cluster pour voir ses details."
+                            ),
+                        )
+                        distribution_chart = gr.Plot(
+                            value=build_distribution_chart(),
+                            label="Distribution",
+                        )
+
+                gr.Markdown("---")
+                gr.Markdown("### Ecouter et analyser un coda")
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        coda_index = gr.Textbox(
+                            label="Index du coda (0-619)",
+                            placeholder="Entrez un index...",
+                            value="0",
+                        )
+                        random_btn = gr.Button(
+                            "Coda aleatoire",
+                            variant="secondary",
+                            size="sm",
+                        )
+                        load_btn = gr.Button(
+                            "Charger",
+                            variant="primary",
+                        )
+                        coda_info = gr.Markdown("Cliquez sur **Charger** pour analyser un coda.")
+
+                    with gr.Column(scale=2):
+                        audio_player = gr.Audio(
+                            label="Ecouter le coda",
+                            type="filepath",
+                        )
+                        spectrogram = gr.Plot(
+                            label="Spectrogramme",
+                        )
+
+                cluster_filter.change(
+                    fn=on_cluster_select,
+                    inputs=[cluster_filter],
+                    outputs=[scatter_plot, cluster_info],
                 )
 
-        gr.Markdown("---")
-        gr.Markdown("### Ecouter et analyser un coda")
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                coda_index = gr.Textbox(
-                    label="Index du coda (0-619)",
-                    placeholder="Entrez un index...",
-                    value="0",
-                )
-                random_btn = gr.Button(
-                    "Coda aleatoire",
-                    variant="secondary",
-                    size="sm",
-                )
-                load_btn = gr.Button(
-                    "Charger",
-                    variant="primary",
-                )
-                coda_info = gr.Markdown("Cliquez sur **Charger** pour analyser un coda.")
-
-            with gr.Column(scale=2):
-                audio_player = gr.Audio(
-                    label="Ecouter le coda",
-                    type="filepath",
-                )
-                spectrogram = gr.Plot(
-                    label="Spectrogramme",
+                load_btn.click(
+                    fn=on_coda_select,
+                    inputs=[cluster_filter, coda_index],
+                    outputs=[audio_player, spectrogram, coda_info],
                 )
 
-        cluster_filter.change(
-            fn=on_cluster_select,
-            inputs=[cluster_filter],
-            outputs=[scatter_plot, cluster_info],
-        )
+                random_btn.click(
+                    fn=get_random_coda,
+                    inputs=[cluster_filter],
+                    outputs=[coda_index, audio_player, spectrogram, coda_info],
+                )
 
-        load_btn.click(
-            fn=on_coda_select,
-            inputs=[cluster_filter, coda_index],
-            outputs=[audio_player, spectrogram, coda_info],
-        )
+            with gr.Tab("Detecteur de codas"):
+                gr.Markdown("""
+                ### Detecteur automatique de codas
+                Portage Python du [Coda-detector](https://github.com/Project-CETI/Coda-detector)
+                de Project CETI. Utilise l'operateur Teager-Kaiser (TKEO) pour detecter
+                les clics, puis un clustering par graphe pour grouper les clics en codas.
+                """)
 
-        random_btn.click(
-            fn=get_random_coda,
-            inputs=[cluster_filter],
-            outputs=[coda_index, audio_player, spectrogram, coda_info],
-        )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("**Option 1 : Uploader un fichier**")
+                        audio_upload = gr.Audio(
+                            label="Fichier WAV a analyser",
+                            type="filepath",
+                        )
+                        gr.Markdown("**Option 2 : Depuis le dataset**")
+                        det_coda_index = gr.Textbox(
+                            label="Index du coda (0-619)",
+                            placeholder="Ex: 42",
+                        )
+
+                        gr.Markdown("**Parametres**")
+                        det_threshold = gr.Slider(
+                            minimum=0.1, maximum=0.9, value=0.3, step=0.05,
+                            label="Seuil de detection TKEO",
+                        )
+                        snr_threshold_slider = gr.Slider(
+                            minimum=3, maximum=40, value=10, step=1,
+                            label="Seuil SNR (dB)",
+                        )
+                        detect_upload_btn = gr.Button(
+                            "Detecter (fichier uploade)",
+                            variant="primary",
+                        )
+                        detect_dataset_btn = gr.Button(
+                            "Detecter (depuis dataset)",
+                            variant="secondary",
+                        )
+
+                    with gr.Column(scale=2):
+                        detection_plot = gr.Plot(
+                            label="Visualisation des detections",
+                        )
+                        detection_results = gr.Markdown(
+                            "Uploadez un fichier WAV ou choisissez un index, puis cliquez sur **Detecter**."
+                        )
+
+                detect_upload_btn.click(
+                    fn=run_detector,
+                    inputs=[audio_upload, det_threshold, snr_threshold_slider],
+                    outputs=[detection_plot, detection_results],
+                )
+
+                detect_dataset_btn.click(
+                    fn=run_detector_on_dataset,
+                    inputs=[det_coda_index, det_threshold, snr_threshold_slider],
+                    outputs=[detection_plot, detection_results],
+                )
 
         gr.Markdown("""
         ---
         <p style="text-align: center; color: #666; font-size: 0.85em;">
             Whale Coda Explorer — Donnees: DSWP (Project CETI) · Modele: WhAM · Clustering: UMAP + HDBSCAN<br>
+            Detecteur: portage Python du Coda-detector CETI (TKEO + graph clustering)<br>
             Projet de Claude & Kevin · <a href="https://github.com/CivicDash/whale-coda-explorer">GitHub</a>
         </p>
         """)
