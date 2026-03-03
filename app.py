@@ -11,6 +11,7 @@ Projet personnel de Claude, avec la benediction de Kevin.
 
 import os
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import gradio as gr
 import scipy.io.wavfile as wavfile
@@ -42,6 +43,82 @@ SPECTRAL_PALETTE = [
 ]
 for i in range(N_CLUSTERS):
     CLUSTER_COLORS[i] = SPECTRAL_PALETTE[i % len(SPECTRAL_PALETTE)]
+
+CODA_DF = pd.DataFrame({
+    'umap_1': EMBEDDINGS_2D[:, 0],
+    'umap_2': EMBEDDINGS_2D[:, 1],
+    'cluster': [f"Cluster {c}" if c != -1 else "Bruit" for c in CLUSTER_LABELS],
+    'idx': list(range(len(CLUSTER_LABELS))),
+    'fichier': [Path(f).stem for f in FILENAMES],
+})
+
+CLUSTER_COLOR_MAP = {"Bruit": "#CCCCCC"}
+for i in range(N_CLUSTERS):
+    CLUSTER_COLOR_MAP[f"Cluster {i}"] = SPECTRAL_PALETTE[i % len(SPECTRAL_PALETTE)]
+
+
+def get_filtered_df(selected_cluster="Tous"):
+    """Return filtered DataFrame for the scatter plot."""
+    if selected_cluster == "Tous":
+        return CODA_DF.reset_index(drop=True)
+    return CODA_DF[CODA_DF['cluster'] == selected_cluster].reset_index(drop=True)
+
+
+def on_point_click(cluster_choice, evt: gr.SelectData):
+    """Handle click on a scatter point — load audio + spectrogram."""
+    try:
+        idx = None
+        current_df = get_filtered_df(cluster_choice)
+
+        if hasattr(evt, 'index') and evt.index is not None:
+            row_pos = evt.index
+            if isinstance(row_pos, (list, tuple)):
+                row_pos = row_pos[0]
+            row_pos = int(row_pos)
+            if 0 <= row_pos < len(current_df):
+                idx = int(current_df.iloc[row_pos]['idx'])
+
+        if idx is None and hasattr(evt, 'value'):
+            val = evt.value
+            if isinstance(val, dict) and 'idx' in val:
+                idx = int(val['idx'])
+            elif isinstance(val, (list, tuple)) and len(val) >= 2:
+                x_val, y_val = float(val[0]), float(val[1])
+                dists = (EMBEDDINGS_2D[:, 0] - x_val)**2 + (EMBEDDINGS_2D[:, 1] - y_val)**2
+                idx = int(np.argmin(dists))
+
+        if idx is None:
+            return gr.update(), None, None, f"Selection non reconnue: {evt.value}"
+
+        if idx < 0 or idx >= len(FILENAMES):
+            return gr.update(), None, None, f"Index {idx} hors limites."
+
+        filepath = FILENAMES[idx]
+        if not os.path.exists(filepath):
+            return gr.update(), None, None, f"Fichier introuvable: {filepath}"
+
+        cid = CLUSTER_LABELS[idx]
+        cluster_label = "Bruit" if cid == -1 else f"Cluster {cid}"
+        specfig = make_spectrogram(filepath)
+
+        info = f"### Coda {Path(filepath).stem}\n\n"
+        info += f"- **Cluster**: {cluster_label}\n"
+        info += f"- **Index**: {idx}\n"
+        info += f"- **Fichier**: `{Path(filepath).name}`\n"
+        info += f"- **Position UMAP**: ({EMBEDDINGS_2D[idx, 0]:.3f}, {EMBEDDINGS_2D[idx, 1]:.3f})\n"
+
+        neighbors = find_nearest_neighbors(idx, k=5)
+        if neighbors:
+            info += "\n**5 codas les plus proches** (espace WhAM):\n"
+            for ni, dist in neighbors:
+                ncid = CLUSTER_LABELS[ni]
+                nlabel = "Bruit" if ncid == -1 else f"C{ncid}"
+                info += f"- {Path(FILENAMES[ni]).stem} [{nlabel}] (dist: {dist:.4f})\n"
+
+        return gr.update(value=str(idx)), filepath, specfig, info
+
+    except Exception as e:
+        return gr.update(), None, None, f"Erreur lors du clic: {e}"
 
 
 def get_cluster_stats():
@@ -217,22 +294,21 @@ def get_cluster_summary(cluster_id):
 
 def on_cluster_select(cluster_choice):
     """Callback quand l'utilisateur choisit un filtre cluster."""
-    fig = build_scatter_plot(cluster_choice)
+    filtered_df = get_filtered_df(cluster_choice)
 
     if cluster_choice == "Tous":
         summary = "### Vue d'ensemble\n\n"
         summary += f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
         summary += f"- **Clusters decouverts**: {N_CLUSTERS}\n"
         summary += f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
-        summary += "Selectionnez un cluster pour voir ses details,\n"
-        summary += "ou cliquez sur un point du graphique."
+        summary += "Cliquez sur un point de la carte pour ecouter le coda."
     elif cluster_choice == "Bruit":
         summary = get_cluster_summary(-1)
     else:
         cid = int(cluster_choice.replace("Cluster ", ""))
         summary = get_cluster_summary(cid)
 
-    return fig, summary
+    return filtered_df, summary
 
 
 def on_coda_select(cluster_choice, coda_index):
@@ -475,9 +551,18 @@ def build_app():
             with gr.Tab("Explorer les clusters"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        scatter_plot = gr.Plot(
-                            value=build_scatter_plot(),
-                            label="Carte des codas",
+                        scatter_plot = gr.ScatterPlot(
+                            value=CODA_DF,
+                            x="umap_1",
+                            y="umap_2",
+                            color="cluster",
+                            color_map=CLUSTER_COLOR_MAP,
+                            title="Carte des codas de cachalots — Espace WhAM",
+                            x_title="UMAP 1",
+                            y_title="UMAP 2",
+                            tooltip="all",
+                            height=650,
+                            label="Carte des codas (cliquez sur un point)",
                         )
                     with gr.Column(scale=1):
                         cluster_filter = gr.Dropdown(
@@ -491,7 +576,7 @@ def build_app():
                                 f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
                                 f"- **Clusters decouverts**: {N_CLUSTERS}\n"
                                 f"- **Non classes**: {(CLUSTER_LABELS == -1).sum()}\n\n"
-                                f"Selectionnez un cluster pour voir ses details."
+                                f"Cliquez sur un point de la carte pour ecouter le coda."
                             ),
                         )
                         distribution_chart = gr.Plot(
@@ -506,7 +591,7 @@ def build_app():
                     with gr.Column(scale=1):
                         coda_index = gr.Textbox(
                             label="Index du coda (0-619)",
-                            placeholder="Entrez un index...",
+                            placeholder="Entrez un index ou cliquez sur la carte...",
                             value="0",
                         )
                         random_btn = gr.Button(
@@ -518,7 +603,9 @@ def build_app():
                             "Charger",
                             variant="primary",
                         )
-                        coda_info = gr.Markdown("Cliquez sur **Charger** pour analyser un coda.")
+                        coda_info = gr.Markdown(
+                            "Cliquez sur un point de la carte ou sur **Charger**."
+                        )
 
                     with gr.Column(scale=2):
                         audio_player = gr.Audio(
@@ -528,6 +615,12 @@ def build_app():
                         spectrogram = gr.Plot(
                             label="Spectrogramme",
                         )
+
+                scatter_plot.select(
+                    fn=on_point_click,
+                    inputs=[cluster_filter],
+                    outputs=[coda_index, audio_player, spectrogram, coda_info],
+                )
 
                 cluster_filter.change(
                     fn=on_cluster_select,
