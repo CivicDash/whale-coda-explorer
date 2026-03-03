@@ -72,6 +72,15 @@ L'app permet de :
 - Voir le spectrogramme et la forme d'onde
 - Trouver les 5 voisins les plus proches dans l'espace WhAM
 - **Detecter automatiquement les codas** dans un fichier WAV (onglet "Detecteur")
+- **Explorer l'identite des cachalots** (onglet "Identite") : 3876 codas annotees par individu, unite sociale et type (Gero et al., 2015)
+
+### Identite des cachalots (Gero et al., 2015)
+
+Visualisation interactive du dataset [Gero, Whitehead & Rendell (2015)](https://doi.org/10.5061/dryad.ck4h0) : 3876 codas des Caraibes orientales avec :
+- **17 cachalots identifies** par photo-ID et mesure acoustique
+- **9 unites sociales** (clans familiaux)
+- **21 types de codas** (dont "1+1+3" et "5R1" qui representent 65% des vocalisations)
+- Coloration par type de coda, unite sociale, individu ou annee
 
 ### Detecteur de codas (Python)
 
@@ -108,8 +117,10 @@ whale-coda-explorer/
 ├── requirements.txt
 ├── app.py                    # App web interactive (Gradio)
 ├── coda_detector.py          # Detecteur de codas (port Python du MATLAB CETI)
+├── analyze_gero.py           # Analyse du dataset Gero et al. (identite)
 ├── explore_codas.py          # Script d'extraction et clustering
 ├── download_dswp.py          # Telechargement du dataset DSWP
+├── data/                     # Datasets externes (Dryad)
 └── exploration_output/       # Resultats de l'analyse
     ├── coda_clusters_map.png
     ├── cluster_distribution.png
@@ -131,6 +142,7 @@ whale-coda-explorer/
 - **[Project CETI](https://www.projectceti.org/)** — Pour WhAM, le dataset DSWP, et leur travail extraordinaire sur la communication des cachalots
 - **[WhAM: Towards A Translative Model of Sperm Whale Vocalization](https://arxiv.org/abs/2512.02206)** — Paradise et al., NeurIPS 2025
 - **[Automatic Detection and Annotation of Sperm Whale Codas](https://arxiv.org/abs/2407.17119)** — Project CETI, 2024 (algorithme original du Coda-detector)
+- **[Individual, unit, and vocal clan level identity cues in sperm whale codas](https://doi.org/10.1098/rsos.150372)** — Gero, Whitehead & Rendell, 2016 (dataset d'identification)
 - **[Civis-Consilium](https://civis-consilium.org/)** — Association europeenne pour le renforcement du lien entre citoyens et institutions, qui heberge ce projet comme outil open source de mediation entre humains et nature
 
 ## A propos
