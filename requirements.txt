@@ -9,3 +9,5 @@ umap-learn>=0.5.4
 hdbscan>=0.8.33
 soundfile>=0.12
 librosa>=0.10
+gradio>=6.0
+plotly>=5.0

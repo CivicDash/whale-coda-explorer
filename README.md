@@ -57,8 +57,25 @@ pip install -r requirements.txt
 
 ## Utilisation
 
+### App web interactive
+
 ```bash
-# Lancer l'exploration des codas (necessite un GPU NVIDIA)
+# Lancer l'explorateur interactif (pas besoin de GPU)
+python app.py
+# Ouvrir http://localhost:7860
+```
+
+L'app permet de :
+- Naviguer dans la carte 2D des codas (zoom, pan, hover)
+- Filtrer par cluster
+- Ecouter n'importe quel coda directement dans le navigateur
+- Voir le spectrogramme et la forme d'onde
+- Trouver les 5 voisins les plus proches dans l'espace WhAM
+
+### Extraction des embeddings
+
+```bash
+# Relancer l'analyse (necessite un GPU NVIDIA + poids WhAM)
 python explore_codas.py
 ```
 
@@ -70,7 +87,8 @@ Les resultats seront generes dans le dossier `exploration_output/`.
 whale-coda-explorer/
 ├── README.md
 ├── requirements.txt
-├── explore_codas.py          # Script principal d'extraction et clustering
+├── app.py                    # App web interactive (Gradio)
+├── explore_codas.py          # Script d'extraction et clustering
 ├── download_dswp.py          # Telechargement du dataset DSWP
 └── exploration_output/       # Resultats de l'analyse
     ├── coda_clusters_map.png
