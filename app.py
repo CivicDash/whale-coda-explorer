@@ -23,6 +23,7 @@ from io import BytesIO
 from coda_detector import detect_codas, codas_to_dict, DetectorParams, teager_kaiser
 
 DATA_DIR = Path(__file__).parent / "exploration_output"
+GERO_PATH = Path(__file__).parent / "data" / "gero2015_codas.xlsx"
 EMBEDDINGS_2D = np.load(DATA_DIR / "embedding_2d.npy")
 CLUSTER_LABELS = np.load(DATA_DIR / "cluster_labels.npy")
 FULL_EMBEDDINGS = np.load(DATA_DIR / "embeddings.npy")
@@ -405,6 +406,149 @@ def build_distribution_chart():
     return fig
 
 
+GERO_DF = None
+GERO_EMBEDDING = None
+if GERO_PATH.exists():
+    _gero_raw = pd.read_excel(GERO_PATH)
+    _gero_raw['Date'] = pd.to_datetime('1899-12-30') + pd.to_timedelta(_gero_raw['Date'], unit='D')
+    _gero_raw['Year'] = _gero_raw['Date'].dt.year
+    _unit_map = {1: "A", 2: "B", 3: "F", 4: "J", 5: "N", 6: "R", 7: "S", 8: "T", 9: "U"}
+    _gero_raw['UnitName'] = _gero_raw['Unit'].map(_unit_map).fillna("?")
+    GERO_DF = _gero_raw[_gero_raw['CodaName'] != 'NOISE'].reset_index(drop=True)
+
+    _gero_emb_path = DATA_DIR / 'gero_embedding_2d.npy'
+    if _gero_emb_path.exists():
+        GERO_EMBEDDING = np.load(_gero_emb_path)
+
+
+def build_gero_scatter_df(color_by="CodaName"):
+    """Build DataFrame for Gero dataset scatter plot."""
+    if GERO_DF is None or GERO_EMBEDDING is None:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        'umap_1': GERO_EMBEDDING[:, 0],
+        'umap_2': GERO_EMBEDDING[:, 1],
+        'idx': range(len(GERO_DF)),
+    })
+
+    if color_by == "CodaName":
+        df['group'] = GERO_DF['CodaName'].values
+    elif color_by == "UnitName":
+        df['group'] = ("Unit " + GERO_DF['UnitName']).values
+    elif color_by == "WhaleID":
+        df['group'] = GERO_DF['WhaleID'].apply(
+            lambda x: f"Whale {x}" if x != 0 else "Non identifie"
+        ).values
+    elif color_by == "Year":
+        df['group'] = GERO_DF['Year'].astype(str).values
+    else:
+        df['group'] = GERO_DF['CodaName'].values
+
+    df['fichier'] = GERO_DF['CodaName'].values
+    return df
+
+
+def on_gero_color_change(color_by):
+    """Update scatter plot when color-by changes."""
+    color_map = {
+        "Type de coda": "CodaName",
+        "Unite sociale": "UnitName",
+        "Individu": "WhaleID",
+        "Annee": "Year",
+    }
+    col = color_map.get(color_by, "CodaName")
+    df = build_gero_scatter_df(col)
+    return df, get_gero_summary(col)
+
+
+def get_gero_summary(color_by="CodaName"):
+    """Summary stats for the Gero dataset."""
+    if GERO_DF is None:
+        return "Dataset non charge."
+
+    md = f"### Dataset Gero et al. (2015)\n\n"
+    md += f"- **Codas**: {len(GERO_DF)}\n"
+    md += f"- **Types**: {GERO_DF['CodaName'].nunique()}\n"
+    md += f"- **Unites sociales**: {GERO_DF['Unit'].nunique()}\n"
+    md += f"- **Individus identifies**: {GERO_DF[GERO_DF['WhaleID'] != 0]['WhaleID'].nunique()}\n"
+    md += f"- **Periode**: {GERO_DF['Year'].min()}-{GERO_DF['Year'].max()}\n\n"
+
+    if color_by == "CodaName":
+        md += "**Types les plus frequents:**\n"
+        for name, count in GERO_DF['CodaName'].value_counts().head(8).items():
+            pct = 100 * count / len(GERO_DF)
+            md += f"- {name}: {count} ({pct:.1f}%)\n"
+    elif color_by == "UnitName":
+        md += "**Unites sociales:**\n"
+        for unit in sorted(GERO_DF['UnitName'].unique()):
+            count = (GERO_DF['UnitName'] == unit).sum()
+            md += f"- Unit {unit}: {count} codas\n"
+    elif color_by == "WhaleID":
+        md += "**Individus identifies:**\n"
+        identified = GERO_DF[GERO_DF['WhaleID'] != 0]
+        for wid, count in identified['WhaleID'].value_counts().head(10).items():
+            unit = identified[identified['WhaleID'] == wid]['UnitName'].iloc[0]
+            md += f"- Whale {wid} (Unit {unit}): {count} codas\n"
+        unid = (GERO_DF['WhaleID'] == 0).sum()
+        md += f"- Non identifies: {unid}\n"
+    elif color_by == "Year":
+        md += "**Par annee:**\n"
+        for year in sorted(GERO_DF['Year'].unique()):
+            count = (GERO_DF['Year'] == year).sum()
+            md += f"- {year}: {count} codas\n"
+
+    return md
+
+
+def on_gero_point_click(color_choice, evt: gr.SelectData):
+    """Handle click on Gero scatter plot."""
+    if GERO_DF is None:
+        return "Dataset non charge."
+
+    try:
+        color_map = {
+            "Type de coda": "CodaName",
+            "Unite sociale": "UnitName",
+            "Individu": "WhaleID",
+            "Annee": "Year",
+        }
+        col = color_map.get(color_choice, "CodaName")
+        current_df = build_gero_scatter_df(col)
+
+        idx = None
+        if hasattr(evt, 'index') and evt.index is not None:
+            row_pos = evt.index
+            if isinstance(row_pos, (list, tuple)):
+                row_pos = row_pos[0]
+            row_pos = int(row_pos)
+            if 0 <= row_pos < len(current_df):
+                idx = int(current_df.iloc[row_pos]['idx'])
+
+        if idx is None:
+            return "Selection non reconnue."
+
+        row = GERO_DF.iloc[idx]
+        ici_cols = ['ICI1', 'ICI2', 'ICI3', 'ICI4', 'ICI5', 'ICI6', 'ICI7', 'ICI8', 'ICI9']
+        icis = [row[c] for c in ici_cols if row[c] > 0]
+        icis_str = ", ".join(f"{ici*1000:.0f}ms" for ici in icis)
+
+        whale_str = f"Whale {row['WhaleID']}" if row['WhaleID'] != 0 else "Non identifie"
+
+        md = f"### Coda #{row['CodaNumber']}\n\n"
+        md += f"- **Type**: {row['CodaName']}\n"
+        md += f"- **Unite sociale**: Unit {row['UnitName']}\n"
+        md += f"- **Individu**: {whale_str}\n"
+        md += f"- **Clics**: {row['nClicks']}\n"
+        md += f"- **Duree**: {row['Length']*1000:.0f} ms\n"
+        md += f"- **ICIs**: [{icis_str}]\n"
+        md += f"- **Date**: {row['Date'].strftime('%Y-%m-%d')}\n"
+
+        return md
+    except Exception as e:
+        return f"Erreur: {e}"
+
+
 def run_detector(audio_file, det_threshold, snr_threshold):
     """Run coda detector on uploaded audio file."""
     if audio_file is None:
@@ -639,6 +783,64 @@ def build_app():
                     inputs=[cluster_filter],
                     outputs=[coda_index, audio_player, spectrogram, coda_info],
                 )
+
+            with gr.Tab("Identite des cachalots"):
+                gr.Markdown("""
+                ### Qui parle ? — Identification par les codas
+                Dataset [Gero, Whitehead & Rendell (2015)](https://doi.org/10.5061/dryad.ck4h0) :
+                3876 codas des Caraibes orientales avec identification
+                des individus, unites sociales et types de codas.
+                Cliquez sur un point pour voir les details.
+                """)
+
+                if GERO_DF is not None and GERO_EMBEDDING is not None:
+                    gero_color_choices = [
+                        "Type de coda", "Unite sociale", "Individu", "Annee"
+                    ]
+
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            gero_scatter = gr.ScatterPlot(
+                                value=build_gero_scatter_df("CodaName"),
+                                x="umap_1",
+                                y="umap_2",
+                                color="group",
+                                title="Codas de cachalots — Projection ICI (Gero et al.)",
+                                x_title="UMAP 1",
+                                y_title="UMAP 2",
+                                tooltip="all",
+                                height=600,
+                                label="Cliquez sur un point",
+                            )
+                        with gr.Column(scale=1):
+                            gero_color_by = gr.Dropdown(
+                                choices=gero_color_choices,
+                                value="Type de coda",
+                                label="Colorer par",
+                            )
+                            gero_info = gr.Markdown(
+                                value=get_gero_summary("CodaName"),
+                            )
+                            gero_detail = gr.Markdown(
+                                "Cliquez sur un point pour voir ses details.",
+                            )
+
+                    gero_color_by.change(
+                        fn=on_gero_color_change,
+                        inputs=[gero_color_by],
+                        outputs=[gero_scatter, gero_info],
+                    )
+
+                    gero_scatter.select(
+                        fn=on_gero_point_click,
+                        inputs=[gero_color_by],
+                        outputs=[gero_detail],
+                    )
+                else:
+                    gr.Markdown(
+                        "Dataset Gero non disponible. "
+                        "Lancez `python analyze_gero.py` pour generer les embeddings."
+                    )
 
             with gr.Tab("Detecteur de codas"):
                 gr.Markdown("""
