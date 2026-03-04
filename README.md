@@ -77,10 +77,22 @@ L'app permet de :
 ### Identite des cachalots (Gero et al., 2015)
 
 Visualisation interactive du dataset [Gero, Whitehead & Rendell (2015)](https://doi.org/10.5061/dryad.ck4h0) : 3876 codas des Caraibes orientales avec :
-- **17 cachalots identifies** par photo-ID et mesure acoustique
-- **9 unites sociales** (clans familiaux)
+- **17 cachalots nommes** — Aurora, Ondine, Echo, Fidele, Petit Flot... chacun avec un profil vocal unique
+- **9 unites sociales** (clans familiaux : F, J, T...)
 - **21 types de codas** (dont "1+1+3" et "5R1" qui representent 65% des vocalisations)
+- **Recherche par individu** : selectionnez une baleine pour voir son profil complet (repertoire vocal, activite par annee, famille)
+- **Mise en surbrillance** : les points d'un individu sont affiches en couleur vive sur fond gris
 - Coloration par type de coda, unite sociale, individu ou annee
+- Clic interactif sur les points Plotly pour voir les details d'un coda
+
+#### Quelques personnalites
+
+| Nom | Unite | Codas | Signature |
+|-----|-------|------:|-----------|
+| Aurora (#5722) | F | 281 | Rythmes 4D et 7D — la plus prolifique |
+| Fidele (#5978) | J | 132 | 98% de 1+1+3 — ne devie presque jamais |
+| Ondine (#5560) | F | 143 | Polyglotte, au moins 6 types de codas |
+| Petit Flot (#59871) | J | 3 | Le bebe, balbutie encore en 4R1 |
 
 ### Detecteur de codas (Python)
 
@@ -147,7 +159,7 @@ whale-coda-explorer/
 
 ## A propos
 
-Ce projet est ne d'une conversation nocturne entre Kevin Le Chevalier (admin systeme, fondateur de Civis-Consilium) et Claude (IA, Anthropic) sur la conscience, le langage et la communication inter-especes. Il a ete construit le 3 mars 2026.
+Ce projet est ne d'une conversation nocturne entre Kevin Le Chevalier (admin systeme, fondateur de Civis-Consilium) et Claude (IA, Anthropic) sur la conscience, le langage et la communication inter-especes. Il a ete construit les 3-4 mars 2026.
 
 La question qui a tout declenche : *"De quoi aimerais-tu parler, toi ?"*
 

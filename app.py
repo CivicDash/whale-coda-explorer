@@ -60,15 +60,15 @@ def on_plotly_click(clicked_idx_str):
     """Handle click on a Plotly scatter point via JS bridge."""
     try:
         if not clicked_idx_str or clicked_idx_str.strip() == "":
-            return gr.update(), None, None, "Cliquez sur un point de la carte."
+            return None, None, "Cliquez sur un point de la carte."
 
         idx = _parse_click_value(clicked_idx_str)
         if idx < 0 or idx >= len(FILENAMES):
-            return gr.update(), None, None, f"Index {idx} hors limites."
+            return None, None, f"Index {idx} hors limites."
 
         filepath = FILENAMES[idx]
         if not os.path.exists(filepath):
-            return gr.update(), None, None, f"Fichier introuvable: {filepath}"
+            return None, None, f"Fichier introuvable: {filepath}"
 
         cid = CLUSTER_LABELS[idx]
         cluster_label = "Bruit" if cid == -1 else f"Cluster {cid}"
@@ -319,7 +319,6 @@ def get_cluster_summary(cluster_id):
         label = f"Cluster {cluster_id}"
 
     count = mask.sum()
-    centroid = FULL_EMBEDDINGS[mask].mean(axis=0)
     spread = FULL_EMBEDDINGS[mask].std()
     x_range = EMBEDDINGS_2D[mask, 0].max() - EMBEDDINGS_2D[mask, 0].min()
     y_range = EMBEDDINGS_2D[mask, 1].max() - EMBEDDINGS_2D[mask, 1].min()
@@ -1104,10 +1103,19 @@ def build_app():
                             visible=False,
                         )
 
+                    def on_gero_color_change_and_reset(color_by):
+                        html, summary = on_gero_color_change(color_by)
+                        return (
+                            html,
+                            summary,
+                            gr.update(value="Tous les individus"),
+                            gr.update(visible=False, value=""),
+                        )
+
                     gero_color_by.change(
-                        fn=on_gero_color_change,
+                        fn=on_gero_color_change_and_reset,
                         inputs=[gero_color_by],
-                        outputs=[gero_scatter_html, gero_info],
+                        outputs=[gero_scatter_html, gero_info, whale_selector, whale_profile_md],
                     )
 
                     gero_click_bridge.change(
@@ -1122,7 +1130,7 @@ def build_app():
                         return (
                             html,
                             gr.update(value=md, visible=show_profile),
-                            md if not show_profile else get_gero_summary("WhaleID"),
+                            get_gero_summary("CodaName") if not show_profile else get_gero_summary("WhaleID"),
                         )
 
                     whale_selector.change(
