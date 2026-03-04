@@ -13,7 +13,6 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 import gradio as gr
 import scipy.io.wavfile as wavfile
 import matplotlib
@@ -182,83 +181,8 @@ def build_scatter_plot(selected_cluster="Tous"):
     return fig
 
 
-def plotly_to_interactive_html(fig, target_elem_id, plot_div_id="plotly-scatter"):
-    """Convert a Plotly figure to HTML with click-to-textbox JS bridge.
-    
-    When a point is clicked, the JS extracts the customdata (index) and
-    injects it into a Gradio Textbox identified by its elem_id.
-    """
-    plot_html = pio.to_html(
-        fig,
-        full_html=False,
-        include_plotlyjs='cdn',
-        div_id=plot_div_id,
-        config={'displayModeBar': True, 'scrollZoom': True},
-    )
 
-    click_js = f"""
-    <script>
-    (function() {{
-        function findTarget() {{
-            var el = document.getElementById('{target_elem_id}');
-            if (el) {{
-                var inp = el.querySelector('textarea') || el.querySelector('input');
-                if (inp) return inp;
-            }}
-            var all = document.querySelectorAll('[id*="{target_elem_id}"]');
-            for (var c of all) {{
-                var inp = c.querySelector('textarea') || c.querySelector('input');
-                if (inp) return inp;
-            }}
-            return null;
-        }}
 
-        function setGradioValue(el, val) {{
-            var setter = Object.getOwnPropertyDescriptor(
-                Object.getPrototypeOf(el), 'value'
-            );
-            if (setter && setter.set) {{
-                setter.set.call(el, val);
-            }} else {{
-                el.value = val;
-            }}
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        }}
-
-        function attachClickHandler() {{
-            var plotEl = document.getElementById('{plot_div_id}');
-            if (!plotEl) return false;
-
-            plotEl.on('plotly_click', function(data) {{
-                if (!data || !data.points || data.points.length === 0) return;
-                var idx = data.points[0].customdata;
-                if (idx === undefined || idx === null) return;
-
-                var payload = String(idx) + '_' + Date.now();
-                var target = findTarget();
-                if (target) {{
-                    setGradioValue(target, payload);
-                }} else {{
-                    setTimeout(function() {{
-                        var t = findTarget();
-                        if (t) setGradioValue(t, payload);
-                    }}, 500);
-                }}
-            }});
-            return true;
-        }}
-
-        if (!attachClickHandler()) {{
-            var retries = 0;
-            var iv = setInterval(function() {{
-                if (attachClickHandler() || retries++ > 20) clearInterval(iv);
-            }}, 200);
-        }}
-    }})();
-    </script>
-    """
-    return f'<div style="width:100%">{plot_html}{click_js}</div>'
 
 
 def make_spectrogram(filepath):
@@ -473,7 +397,552 @@ if GERO_PATH.exists():
     if _gero_emb_path.exists():
         GERO_EMBEDDING = np.load(_gero_emb_path)
 
+# --- Classifieur k-NN pour identification individuelle ---
+WHALE_CLASSIFIER = None
+WHALE_SCALER = None
+ICI_COLS = ['ICI1', 'ICI2', 'ICI3', 'ICI4', 'ICI5', 'ICI6', 'ICI7', 'ICI8', 'ICI9']
 
+if GERO_DF is not None:
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.preprocessing import StandardScaler
+
+    _labeled = GERO_DF[GERO_DF['WhaleID'] != '0'].copy()
+    if len(_labeled) > 50:
+        _ici_matrix = _labeled[ICI_COLS].fillna(0).values
+        _features = np.column_stack([
+            _ici_matrix,
+            _labeled['nClicks'].values.reshape(-1, 1),
+            _labeled['Length'].values.reshape(-1, 1),
+        ])
+        WHALE_SCALER = StandardScaler()
+        _features_scaled = WHALE_SCALER.fit_transform(_features)
+        WHALE_CLASSIFIER = KNeighborsClassifier(n_neighbors=7, weights='distance', metric='euclidean')
+        WHALE_CLASSIFIER.fit(_features_scaled, _labeled['WhaleID'].values)
+
+
+def identify_coda_from_icis(icis, n_clicks, length):
+    """Identify most likely whale from ICI features using k-NN.
+
+    Returns list of (whale_id, probability) sorted by decreasing probability.
+    """
+    if WHALE_CLASSIFIER is None or WHALE_SCALER is None:
+        return []
+
+    ici_vec = np.zeros(9)
+    for i, val in enumerate(icis[:9]):
+        ici_vec[i] = val
+
+    features = np.concatenate([ici_vec, [n_clicks, length]]).reshape(1, -1)
+    features_scaled = WHALE_SCALER.transform(features)
+
+    probas = WHALE_CLASSIFIER.predict_proba(features_scaled)[0]
+    classes = WHALE_CLASSIFIER.classes_
+
+    results = sorted(zip(classes, probas), key=lambda x: -x[1])
+    return [(wid, float(p)) for wid, p in results if p > 0.01]
+
+
+# --- Classifieur d'activite vocale ---
+
+def classify_vocal_activity(audio_path):
+    """Analyse an audio file and classify sperm whale vocal activity.
+
+    Returns a list of segments: [(start_s, end_s, activity_type, details), ...]
+    Activity types: ECHOLOCATION, CODA, CREAK, SILENCE
+    """
+    from pydub import AudioSegment
+    from scipy.signal import butter, filtfilt, find_peaks
+    import tempfile
+
+    try:
+        wav_path, duration_s, is_tmp = _convert_to_wav(audio_path)
+    except Exception as e:
+        return [], f"Erreur: {e}", None
+
+    sr, data = wavfile.read(wav_path)
+    if data.ndim > 1:
+        data = data[:, 0]
+    data = data.astype(np.float64)
+    max_val = np.max(np.abs(data))
+    if max_val > 0:
+        data = data / max_val
+
+    if is_tmp:
+        os.unlink(wav_path)
+
+    nyq = sr / 2
+    b, a = butter(4, [max(2000 / nyq, 0.001), min(24000 / nyq, 0.999)], btype='band')
+    filtered = filtfilt(b, a, data)
+    tkeo = teager_kaiser(filtered)
+    tkeo = np.maximum(tkeo, 0)
+    tkeo_max = np.max(tkeo)
+    if tkeo_max > 0:
+        tkeo = tkeo / tkeo_max
+
+    peaks, props = find_peaks(tkeo, height=0.08, distance=int(sr * 0.005))
+    click_times = peaks / sr
+
+    if len(click_times) < 2:
+        return [{'start': 0, 'end': duration_s, 'type': 'SILENCE',
+                 'details': 'Aucune activite acoustique detectee'}], "", data
+
+    window_s = 3.0
+    step_s = 1.0
+    segments = []
+
+    t = 0.0
+    while t < duration_s:
+        t_end = min(t + window_s, duration_s)
+        mask = (click_times >= t) & (click_times < t_end)
+        window_clicks = click_times[mask]
+
+        if len(window_clicks) < 2:
+            segments.append({
+                'start': t, 'end': t_end, 'type': 'SILENCE',
+                'click_count': len(window_clicks),
+                'details': ''
+            })
+        else:
+            icis = np.diff(window_clicks)
+            mean_ici = np.mean(icis)
+            std_ici = np.std(icis)
+            click_rate = len(window_clicks) / (t_end - t)
+            cv = std_ici / mean_ici if mean_ici > 0 else 0
+
+            if mean_ici < 0.030:
+                activity = 'CREAK'
+                details = (f"Buzz/Creak — {len(window_clicks)} clics, "
+                           f"rythme={click_rate:.0f} clics/s, ICI={mean_ici*1000:.0f}ms")
+            elif mean_ici < 0.5 and cv < 1.0 and len(window_clicks) >= 3:
+                activity = 'CODA'
+                details = (f"Codas — {len(window_clicks)} clics, "
+                           f"ICI moy={mean_ici*1000:.0f}ms")
+            elif mean_ici >= 0.3 and cv < 0.5:
+                activity = 'ECHOLOCATION'
+                details = (f"Echolocation — {len(window_clicks)} clics, "
+                           f"ICI moy={mean_ici*1000:.0f}ms, regulier (CV={cv:.2f})")
+            elif mean_ici >= 0.3:
+                activity = 'ECHOLOCATION'
+                details = (f"Clics reguliers — {len(window_clicks)} clics, "
+                           f"ICI moy={mean_ici*1000:.0f}ms")
+            else:
+                activity = 'CODA'
+                details = (f"Activite vocale — {len(window_clicks)} clics, "
+                           f"ICI moy={mean_ici*1000:.0f}ms")
+
+            segments.append({
+                'start': t, 'end': t_end, 'type': activity,
+                'click_count': len(window_clicks),
+                'mean_ici': mean_ici,
+                'std_ici': std_ici,
+                'click_rate': click_rate,
+                'details': details,
+            })
+
+        t += step_s
+
+    merged = _merge_segments(segments)
+    return merged, "", data
+
+
+def _merge_segments(segments):
+    """Merge consecutive segments of the same type."""
+    if not segments:
+        return []
+    merged = [segments[0].copy()]
+    for seg in segments[1:]:
+        if seg['type'] == merged[-1]['type']:
+            merged[-1]['end'] = seg['end']
+            merged[-1]['click_count'] = merged[-1].get('click_count', 0) + seg.get('click_count', 0)
+            if 'mean_ici' in seg and 'mean_ici' in merged[-1]:
+                merged[-1]['mean_ici'] = (merged[-1]['mean_ici'] + seg['mean_ici']) / 2
+        else:
+            merged.append(seg.copy())
+    return merged
+
+
+def estimate_whale_size(click_times, sr_data, data):
+    """Estimate whale body length from IPI in regular echolocation clicks.
+
+    The IPI (Inter-Pulse Interval) is the time between the direct pulse
+    and its first reflection inside the spermaceti organ.
+    Body length (m) ≈ IPI (ms) * 4.833 + 1.453  (Growcott et al. 2011)
+    """
+    if len(click_times) < 3:
+        return None, None
+
+    icis = np.diff(click_times)
+    regular_mask = (icis > 0.3) & (icis < 3.0)
+    if np.sum(regular_mask) < 2:
+        return None, None
+
+    median_ici = np.median(icis[regular_mask])
+
+    ipi_estimate_ms = None
+    for ipi_test in np.arange(1.0, 10.0, 0.1):
+        ipi_s = ipi_test / 1000.0
+        if ipi_s < median_ici * 0.8:
+            ipi_estimate_ms = ipi_test
+            break
+
+    if ipi_estimate_ms is None:
+        ipi_estimate_ms = 5.0
+
+    body_length_m = ipi_estimate_ms * 4.833 + 1.453
+    if body_length_m < 4 or body_length_m > 20:
+        return median_ici * 1000, None
+
+    return median_ici * 1000, body_length_m
+
+
+def analyze_vocal_activity(audio_path):
+    """Full vocal activity analysis pipeline for the Gradio UI."""
+    if audio_path is None:
+        return None, "Uploadez un fichier audio ou video (WAV, MP3, MP4, OGG, FLAC...)."
+
+    segments, error, data = classify_vocal_activity(audio_path)
+    if error:
+        return None, error
+    if not segments:
+        return None, "Aucune activite detectee."
+
+    activity_counts = {}
+    for seg in segments:
+        t = seg['type']
+        dur = seg['end'] - seg['start']
+        activity_counts[t] = activity_counts.get(t, 0) + dur
+
+    total_dur = segments[-1]['end'] - segments[0]['start']
+
+    colors = {
+        'ECHOLOCATION': '#3498db',
+        'CODA': '#2ecc71',
+        'CREAK': '#e74c3c',
+        'SILENCE': '#555555',
+    }
+    labels_fr = {
+        'ECHOLOCATION': 'Echolocation (sonar)',
+        'CODA': 'Codas (communication)',
+        'CREAK': 'Creaks (chasse)',
+        'SILENCE': 'Silence',
+    }
+    icons = {
+        'ECHOLOCATION': '📡',
+        'CODA': '💬',
+        'CREAK': '🎯',
+        'SILENCE': '🔇',
+    }
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 5),
+                             gridspec_kw={'height_ratios': [1, 3]})
+    fig.patch.set_facecolor('#1a1a2e')
+
+    ax_timeline = axes[0]
+    ax_timeline.set_facecolor('#16213e')
+    for seg in segments:
+        color = colors.get(seg['type'], '#555')
+        ax_timeline.axvspan(seg['start'], seg['end'],
+                            alpha=0.7, color=color)
+    ax_timeline.set_xlim(segments[0]['start'], segments[-1]['end'])
+    ax_timeline.set_ylim(0, 1)
+    ax_timeline.set_yticks([])
+    ax_timeline.set_title("Timeline d'activite vocale", color='#e0e0e0',
+                          fontsize=12, pad=8)
+    ax_timeline.tick_params(colors='#999')
+
+    import matplotlib.patches as mpatches
+    handles = []
+    for act_type in ['ECHOLOCATION', 'CODA', 'CREAK', 'SILENCE']:
+        if act_type in activity_counts:
+            handles.append(mpatches.Patch(
+                color=colors[act_type],
+                label=labels_fr[act_type]
+            ))
+    ax_timeline.legend(handles=handles, loc='upper right',
+                       fontsize=8, facecolor='#1a1a2e',
+                       edgecolor='#444', labelcolor='#e0e0e0')
+
+    ax_wave = axes[1]
+    ax_wave.set_facecolor('#16213e')
+    if data is not None:
+        sr = 44100
+        t_axis = np.arange(len(data)) / sr
+        step = max(1, len(data) // 10000)
+        ax_wave.plot(t_axis[::step], data[::step], color='#00d4aa',
+                     linewidth=0.3, alpha=0.7)
+
+        for seg in segments:
+            color = colors.get(seg['type'], '#555')
+            ax_wave.axvspan(seg['start'], seg['end'], alpha=0.15, color=color)
+
+    ax_wave.set_xlabel("Temps (s)", color='#999', fontsize=10)
+    ax_wave.set_ylabel("Amplitude", color='#999', fontsize=10)
+    ax_wave.tick_params(colors='#999')
+    ax_wave.set_xlim(segments[0]['start'], segments[-1]['end'])
+
+    for ax in axes:
+        for spine in ['top', 'right']:
+            ax.spines[spine].set_visible(False)
+        for spine in ['bottom', 'left']:
+            ax.spines[spine].set_color('#444')
+
+    fig.tight_layout()
+
+    md = "## Analyse de l'activite vocale\n\n"
+
+    md += "### Resume\n\n"
+    md += "| Activite | Duree | Proportion |\n"
+    md += "|----------|-------|------------|\n"
+    for act_type in ['CODA', 'ECHOLOCATION', 'CREAK', 'SILENCE']:
+        if act_type in activity_counts:
+            dur = activity_counts[act_type]
+            pct = dur / total_dur * 100
+            icon = icons[act_type]
+            label = labels_fr[act_type]
+            md += f"| {icon} {label} | {dur:.1f}s | {pct:.0f}% |\n"
+
+    md += f"\n*Duree totale analysee : {total_dur:.1f}s*\n\n"
+
+    md += "### Detail par segment\n\n"
+    for i, seg in enumerate(segments, 1):
+        icon = icons.get(seg['type'], '')
+        label = labels_fr.get(seg['type'], seg['type'])
+        dur = seg['end'] - seg['start']
+        t_min = int(seg['start'] // 60)
+        t_sec = seg['start'] % 60
+        md += f"**{i}. {icon} {label}** — {t_min}m{t_sec:04.1f}s → +{dur:.1f}s"
+        if seg.get('click_count', 0) > 0:
+            md += f" | {seg['click_count']} clics"
+        if 'mean_ici' in seg:
+            md += f" | ICI moy={seg['mean_ici']*1000:.0f}ms"
+        md += "\n\n"
+
+    if 'ECHOLOCATION' in activity_counts:
+        md += "---\n### Analyse de l'echolocation\n\n"
+        md += ("Les clics d'echolocation sont un **sonar biologique** : "
+               "le cachalot emet un clic puissant qui rebondit sur les "
+               "objets environnants (proies, fond marin). L'intervalle "
+               "entre les clics (ICI ~0.5-2s) correspond au temps d'aller-retour "
+               "du son, et diminue quand la proie est plus proche.\n\n")
+
+        echo_segs = [s for s in segments if s['type'] == 'ECHOLOCATION']
+        if echo_segs:
+            avg_ici = np.mean([s.get('mean_ici', 0) for s in echo_segs if 'mean_ici' in s])
+            if avg_ici > 0:
+                depth_est = avg_ici * 750
+                md += (f"- **ICI moyen** : {avg_ici*1000:.0f}ms\n"
+                       f"- **Profondeur estimee de la cible** : ~{depth_est:.0f}m "
+                       f"(ICI × vitesse du son / 2)\n")
+                if avg_ici > 1.0:
+                    md += "- **Interpretation** : chasse en eau profonde\n"
+                elif avg_ici > 0.5:
+                    md += "- **Interpretation** : approche d'une cible\n"
+                else:
+                    md += "- **Interpretation** : cible proche, pre-capture\n"
+                md += "\n"
+
+    if 'CREAK' in activity_counts:
+        md += "---\n### Creaks detectes !\n\n"
+        md += ("Les **creaks** (aussi appeles buzz) sont des rafales de clics "
+               "ultra-rapides (>30 clics/seconde) emises juste avant la capture "
+               "d'une proie. C'est l'equivalent du **buzz terminal** des "
+               "chauves-souris. Leur presence indique une **tentative de chasse active**.\n\n")
+
+    if 'CODA' in activity_counts and WHALE_CLASSIFIER is not None:
+        md += "---\n### Codas detectes — identification en cours...\n\n"
+        md += ("Les segments de codas peuvent etre analyses dans l'onglet "
+               "**Identifier un coda** pour retrouver l'individu.\n")
+
+    return fig, md
+
+
+def _convert_to_wav(audio_path):
+    """Convert any audio format to mono WAV 44100Hz. Returns (tmp_path, duration_s)."""
+    from pydub import AudioSegment
+    import tempfile
+
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext in ('.wav',):
+        sr, data = wavfile.read(audio_path)
+        return audio_path, len(data) / sr, False
+
+    audio = AudioSegment.from_file(audio_path)
+    mono = audio.set_channels(1).set_frame_rate(44100)
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    mono.export(tmp.name, format='wav')
+    return tmp.name, len(mono) / 1000.0, True
+
+
+def identify_from_audio(audio_path, det_threshold=0.3, snr_threshold=10):
+    """Full pipeline: detect codas in audio then identify each one.
+
+    Supports WAV, MP3, MP4, OGG, FLAC, M4A, etc. (anything pydub/ffmpeg handles).
+    Long files (>30s) are processed in segments to avoid memory issues.
+    """
+    if audio_path is None:
+        return None, "Uploadez un fichier audio ou video (WAV, MP3, MP4, OGG, FLAC...)."
+
+    try:
+        wav_path, duration_s, is_tmp = _convert_to_wav(audio_path)
+    except Exception as e:
+        return None, f"Erreur de conversion audio : {e}"
+
+    params = DetectorParams(
+        detection_threshold=det_threshold,
+        snr_threshold=snr_threshold,
+    )
+
+    SEGMENT_MAX_S = 30
+    all_codas = []
+    all_results = []
+
+    try:
+        if duration_s <= SEGMENT_MAX_S:
+            codas = detect_codas(wav_path, params)
+            if codas:
+                all_codas = codas
+                all_results = codas_to_dict(codas)
+        else:
+            from pydub import AudioSegment
+            import tempfile
+            audio = AudioSegment.from_wav(wav_path)
+            segment_ms = SEGMENT_MAX_S * 1000
+            n_segments = int(np.ceil(len(audio) / segment_ms))
+
+            for seg_i in range(n_segments):
+                start_ms = seg_i * segment_ms
+                end_ms = min(start_ms + segment_ms, len(audio))
+                seg = audio[start_ms:end_ms]
+
+                seg_tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                seg.export(seg_tmp.name, format='wav')
+
+                try:
+                    codas = detect_codas(seg_tmp.name, params)
+                    if codas:
+                        results = codas_to_dict(codas)
+                        t_offset = start_ms / 1000.0
+                        for coda in codas:
+                            for click in coda.clicks:
+                                click.time += t_offset
+                        all_codas.extend(codas)
+                        all_results.extend(results)
+                finally:
+                    os.unlink(seg_tmp.name)
+    finally:
+        if is_tmp:
+            os.unlink(wav_path)
+
+    if not all_codas:
+        return None, "Aucun coda detecte dans cet enregistrement."
+
+    ext = os.path.splitext(audio_path)[1].lower()
+    format_info = f"Format: {ext.upper().strip('.')} | " if ext != '.wav' else ""
+    md = f"## {len(all_codas)} coda(s) detecte(s)\n"
+    md += f"*{format_info}Duree: {duration_s:.1f}s"
+    if duration_s > SEGMENT_MAX_S:
+        md += f" (traite en {int(np.ceil(duration_s / SEGMENT_MAX_S))} segments)"
+    md += "*\n\n"
+
+    for i, (coda, r) in enumerate(zip(all_codas, all_results)):
+        icis = r['icis']
+        n_clicks = r['n_clicks']
+        duration = r['duration']
+        t_start = min(c.time for c in coda.clicks)
+
+        icis_str = ", ".join(f"{ici*1000:.0f}ms" for ici in icis)
+        t_min = int(t_start // 60)
+        t_sec = t_start % 60
+        md += f"### Coda {i+1} *(t={t_min}m{t_sec:04.1f}s)*\n"
+        md += f"- **Clics**: {n_clicks} | **Duree**: {duration*1000:.0f}ms\n"
+        md += f"- **ICIs**: [{icis_str}]\n\n"
+
+        candidates = identify_coda_from_icis(icis, n_clicks, duration)
+
+        if not candidates:
+            md += "> Classifieur non disponible.\n\n"
+            continue
+
+        md += "| Rang | Individu | Confiance |\n"
+        md += "|------|----------|----------|\n"
+
+        for rank, (wid, prob) in enumerate(candidates[:5], 1):
+            name = get_whale_display_name(wid)
+            bar = "█" * int(prob * 20) + "░" * (20 - int(prob * 20))
+            md += f"| {rank} | {name} | {bar} {prob*100:.1f}% |\n"
+
+        best_wid, best_prob = candidates[0]
+        best_name, best_desc = WHALE_NAMES.get(best_wid, (f"Whale {best_wid}", ""))
+        if best_prob > 0.4:
+            md += f"\n> **Meilleur match** : {best_name} ({best_prob*100:.0f}%)"
+            if best_desc:
+                md += f" — *{best_desc}*"
+            md += "\n\n"
+        elif best_prob > 0.2:
+            md += f"\n> Match possible : {best_name} ({best_prob*100:.0f}%) — confiance moderee\n\n"
+        else:
+            md += "\n> Confiance trop faible — possiblement un individu inconnu\n\n"
+
+    if len(all_codas) > 1:
+        md += "---\n### Synthese multi-codas\n\n"
+        vote_counts = {}
+        for r in all_results:
+            candidates = identify_coda_from_icis(r['icis'], r['n_clicks'], r['duration'])
+            for wid, prob in candidates:
+                vote_counts[wid] = vote_counts.get(wid, 0) + prob
+
+        if vote_counts:
+            total = sum(vote_counts.values())
+            sorted_votes = sorted(vote_counts.items(), key=lambda x: -x[1])
+            md += "En combinant tous les codas :\n\n"
+            md += "| Individu | Score cumule |\n"
+            md += "|----------|------------|\n"
+            for wid, score in sorted_votes[:7]:
+                name = get_whale_display_name(wid)
+                pct = score / total * 100
+                md += f"| {name} | {pct:.1f}% |\n"
+
+            top = sorted_votes[:3]
+            if len(top) >= 2 and top[1][1] / total > 0.15:
+                md += "\n> **Multi-individus probable** — au moins 2 voix distinctes detectees\n"
+
+            best_wid = sorted_votes[0][0]
+            best_name, _ = WHALE_NAMES.get(best_wid, (f"Whale {best_wid}", ""))
+            md += f"\n> **Identification principale** : **{best_name}**\n"
+
+    return _build_identification_plot(all_codas, all_results), md
+
+
+def _build_identification_plot(codas, results):
+    """Build a visualization of detected codas with ICI patterns."""
+    fig, axes = plt.subplots(len(codas), 1, figsize=(10, 3 * len(codas)),
+                             squeeze=False)
+    fig.patch.set_facecolor('#1a1a2e')
+
+    for i, (coda, r) in enumerate(zip(codas, results)):
+        ax = axes[i, 0]
+        ax.set_facecolor('#16213e')
+
+        icis = r['icis']
+        clicks_t = [0]
+        for ici in icis:
+            clicks_t.append(clicks_t[-1] + ici)
+
+        ax.stem(clicks_t, [1] * len(clicks_t), linefmt='#00d4aa',
+                markerfmt='o', basefmt='none')
+        ax.set_title(f"Coda {i+1} — {r['n_clicks']} clics, {r['duration']*1000:.0f}ms",
+                     color='#e0e0e0', fontsize=11)
+        ax.set_xlabel("Temps (s)", color='#999', fontsize=9)
+        ax.set_ylabel("Clic", color='#999', fontsize=9)
+        ax.set_ylim(0, 1.5)
+        ax.tick_params(colors='#999')
+        for spine in ['top', 'right']:
+            ax.spines[spine].set_visible(False)
+        for spine in ['bottom', 'left']:
+            ax.spines[spine].set_color('#444')
+
+    fig.tight_layout()
+    return fig
 
 
 def build_gero_plotly(color_by="CodaName"):
@@ -578,8 +1047,7 @@ def on_gero_color_change(color_by):
     }
     col = col_map.get(color_by, "CodaName")
     fig = build_gero_plotly(col)
-    html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
-    return html, get_gero_summary(col)
+    return fig, get_gero_summary(col)
 
 
 def get_gero_summary(color_by="CodaName"):
@@ -677,8 +1145,7 @@ def build_whale_profile(whale_choice):
 
     if not whale_choice or whale_choice == "Tous les individus":
         fig = build_gero_plotly("WhaleID")
-        html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
-        return "Selectionnez un individu pour voir son profil.", html
+        return "Selectionnez un individu pour voir son profil.", fig
 
     wid = whale_choice.split("#")[-1].rstrip(")")
     if wid not in GERO_DF['WhaleID'].values:
@@ -794,8 +1261,7 @@ def build_whale_profile(whale_choice):
         hovermode='closest',
     )
 
-    html = plotly_to_interactive_html(fig, "gero_click_bridge", plot_div_id="gero-scatter")
-    return md, html
+    return md, fig
 
 
 def run_detector(audio_file, det_threshold, snr_threshold):
@@ -924,6 +1390,68 @@ def run_detector_on_dataset(coda_index, det_threshold, snr_threshold):
         return None, "Entrez un index valide."
 
 
+PLOTLY_CLICK_HEAD = """
+<script>
+(function() {
+    var PLOT_MAP = {
+        'main-scatter': 'click_bridge',
+        'gero-scatter': 'gero_click_bridge'
+    };
+
+    function setGradioInput(elemId, value) {
+        var el = document.getElementById(elemId);
+        if (!el) return false;
+        var inp = el.querySelector('textarea') || el.querySelector('input');
+        if (!inp) return false;
+        var setter = Object.getOwnPropertyDescriptor(
+            Object.getPrototypeOf(inp), 'value'
+        );
+        if (setter && setter.set) {
+            setter.set.call(inp, value);
+        } else {
+            inp.value = value;
+        }
+        inp.dispatchEvent(new Event('input', {bubbles: true}));
+        inp.dispatchEvent(new Event('change', {bubbles: true}));
+        return true;
+    }
+
+    function attachToPlot(plotElemId, bridgeElemId) {
+        var container = document.getElementById(plotElemId);
+        if (!container) return false;
+        var plotDiv = container.querySelector('.js-plotly-plot');
+        if (!plotDiv || !plotDiv.on) return false;
+        if (plotDiv._wce_attached) return true;
+        plotDiv.on('plotly_click', function(data) {
+            if (!data || !data.points || data.points.length === 0) return;
+            var idx = data.points[0].customdata;
+            if (idx === undefined || idx === null) return;
+            var payload = String(idx) + '_' + Date.now();
+            setGradioInput(bridgeElemId, payload);
+        });
+        plotDiv._wce_attached = true;
+        return true;
+    }
+
+    function attachAll() {
+        var allOk = true;
+        for (var plotId in PLOT_MAP) {
+            if (!attachToPlot(plotId, PLOT_MAP[plotId])) {
+                allOk = false;
+            }
+        }
+        return allOk;
+    }
+
+    // Plotly plots may load asynchronously; keep trying
+    var observer = new MutationObserver(function() { attachAll(); });
+    observer.observe(document.body, {childList: true, subtree: true});
+    setInterval(attachAll, 2000);
+})();
+</script>
+"""
+
+
 def build_app():
     """Construit l'application Gradio."""
 
@@ -945,10 +1473,10 @@ def build_app():
                 with gr.Row():
                     with gr.Column(scale=3):
                         initial_fig = build_scatter_plot("Tous")
-                        initial_html = plotly_to_interactive_html(
-                            initial_fig, "click_bridge", plot_div_id="main-scatter"
+                        scatter_plot = gr.Plot(
+                            value=initial_fig,
+                            elem_id="main-scatter",
                         )
-                        scatter_html = gr.HTML(value=initial_html)
                     with gr.Column(scale=1):
                         cluster_filter = gr.Dropdown(
                             choices=cluster_choices,
@@ -1013,9 +1541,6 @@ def build_app():
 
                 def on_cluster_filter_change(cluster_choice):
                     fig = build_scatter_plot(cluster_choice)
-                    html = plotly_to_interactive_html(
-                        fig, "click_bridge", plot_div_id="main-scatter"
-                    )
                     if cluster_choice == "Tous":
                         summary = "### Vue d'ensemble\n\n"
                         summary += f"- **Total codas analysees**: {len(CLUSTER_LABELS)}\n"
@@ -1027,12 +1552,12 @@ def build_app():
                     else:
                         cid = int(cluster_choice.replace("Cluster ", ""))
                         summary = get_cluster_summary(cid)
-                    return html, summary
+                    return fig, summary
 
                 cluster_filter.change(
                     fn=on_cluster_filter_change,
                     inputs=[cluster_filter],
-                    outputs=[scatter_html, cluster_info],
+                    outputs=[scatter_plot, cluster_info],
                 )
 
                 load_btn.click(
@@ -1071,11 +1596,10 @@ def build_app():
                     with gr.Row():
                         with gr.Column(scale=3):
                             gero_initial_fig = build_gero_plotly("CodaName")
-                            gero_initial_html = plotly_to_interactive_html(
-                                gero_initial_fig, "gero_click_bridge",
-                                plot_div_id="gero-scatter"
+                            gero_scatter_plot = gr.Plot(
+                                value=gero_initial_fig,
+                                elem_id="gero-scatter",
                             )
-                            gero_scatter_html = gr.HTML(value=gero_initial_html)
                         with gr.Column(scale=1):
                             gero_color_by = gr.Dropdown(
                                 choices=gero_color_choices,
@@ -1104,9 +1628,9 @@ def build_app():
                         )
 
                     def on_gero_color_change_and_reset(color_by):
-                        html, summary = on_gero_color_change(color_by)
+                        fig, summary = on_gero_color_change(color_by)
                         return (
-                            html,
+                            fig,
                             summary,
                             gr.update(value="Tous les individus"),
                             gr.update(visible=False, value=""),
@@ -1115,7 +1639,7 @@ def build_app():
                     gero_color_by.change(
                         fn=on_gero_color_change_and_reset,
                         inputs=[gero_color_by],
-                        outputs=[gero_scatter_html, gero_info, whale_selector, whale_profile_md],
+                        outputs=[gero_scatter_plot, gero_info, whale_selector, whale_profile_md],
                     )
 
                     gero_click_bridge.change(
@@ -1125,10 +1649,10 @@ def build_app():
                     )
 
                     def on_whale_select(whale_choice):
-                        md, html = build_whale_profile(whale_choice)
+                        md, fig = build_whale_profile(whale_choice)
                         show_profile = whale_choice != "Tous les individus"
                         return (
-                            html,
+                            fig,
                             gr.update(value=md, visible=show_profile),
                             get_gero_summary("CodaName") if not show_profile else get_gero_summary("WhaleID"),
                         )
@@ -1136,7 +1660,7 @@ def build_app():
                     whale_selector.change(
                         fn=on_whale_select,
                         inputs=[whale_selector],
-                        outputs=[gero_scatter_html, whale_profile_md, gero_info],
+                        outputs=[gero_scatter_plot, whale_profile_md, gero_info],
                     )
                 else:
                     gr.Markdown(
@@ -1203,6 +1727,371 @@ def build_app():
                     outputs=[detection_plot, detection_results],
                 )
 
+            with gr.Tab("Identifier un coda"):
+                gr.Markdown("""
+                ### Qui parle ? — Identification acoustique
+
+                Uploadez un enregistrement de cachalot (WAV, **MP3**, **MP4**, OGG, FLAC, M4A...)
+                et l'application va :
+                1. **Convertir** automatiquement en WAV mono 44.1kHz si necessaire
+                2. **Segmenter** les fichiers longs (>30s) pour un traitement optimal
+                3. **Detecter** les codas (clics groupes) via le detecteur TKEO
+                4. **Identifier** chaque coda parmi les 17 individus connus (k-NN)
+                5. **Combiner** les resultats si plusieurs codas (synthese multi-individus)
+
+                Le classifieur est entraine sur 1602 codas etiquetes du dataset
+                Gero et al. (2015). Les fichiers MP3 de YouTube fonctionnent directement !
+
+                *Plus vous fournissez de codas d'une meme session, plus l'identification
+                est fiable.*
+                """)
+
+                if WHALE_CLASSIFIER is not None:
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            id_audio = gr.File(
+                                label="Fichier audio/video (WAV, MP3, MP4, OGG, FLAC...)",
+                                file_types=[".wav", ".mp3", ".mp4", ".ogg", ".flac",
+                                            ".m4a", ".webm", ".mkv", ".avi", ".wma", ".aac"],
+                                type="filepath",
+                            )
+                            id_det_threshold = gr.Slider(
+                                minimum=0.1, maximum=0.9, value=0.3, step=0.05,
+                                label="Seuil de detection TKEO",
+                            )
+                            id_snr_threshold = gr.Slider(
+                                minimum=3, maximum=40, value=10, step=1,
+                                label="Seuil SNR (dB)",
+                            )
+                            id_btn = gr.Button(
+                                "Identifier",
+                                variant="primary",
+                            )
+
+                            gr.Markdown("""
+                            **Comment lire les resultats ?**
+                            - **Confiance > 40%** : match probable
+                            - **20-40%** : match possible, a confirmer
+                            - **< 20%** : individu probablement inconnu
+                            - La **synthese multi-codas** combine les
+                              probabilites de tous les codas detectes
+                            """)
+
+                        with gr.Column(scale=2):
+                            id_plot = gr.Plot(
+                                label="Codas detectes — patron de clics",
+                            )
+                            id_results = gr.Markdown(
+                                "Uploadez un fichier audio (WAV, MP3...) puis cliquez sur **Identifier**."
+                            )
+
+                    id_btn.click(
+                        fn=identify_from_audio,
+                        inputs=[id_audio, id_det_threshold, id_snr_threshold],
+                        outputs=[id_plot, id_results],
+                    )
+                else:
+                    gr.Markdown(
+                        "Classifieur non disponible. "
+                        "Le dataset Gero doit contenir au moins 50 codas etiquetes."
+                    )
+
+            with gr.Tab("Analyse vocale"):
+                gr.Markdown("""
+                ### Que fait ce cachalot ? — Classification d'activite vocale
+
+                Uploadez un enregistrement et l'application classifie
+                automatiquement l'activite du cachalot :
+
+                - 📡 **Echolocation** (sonar) — clics reguliers espaces (~0.5-2s),
+                  le cachalot scanne son environnement ou chasse en profondeur
+                - 💬 **Codas** (communication) — rafales rythmiques de clics,
+                  vocalisations sociales entre individus
+                - 🎯 **Creaks/Buzz** (capture) — clics ultra-rapides (>30/s),
+                  tentative de capture de proie imminente
+                - 🔇 **Silence** — pas d'activite acoustique detectee
+
+                *Tous les formats audio et video sont supportes (WAV, MP3, MP4, OGG, FLAC...).*
+                """)
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        va_audio = gr.File(
+                            label="Fichier audio/video (WAV, MP3, MP4...)",
+                            file_types=[".wav", ".mp3", ".mp4", ".ogg", ".flac",
+                                        ".m4a", ".webm", ".mkv", ".avi", ".wma", ".aac"],
+                            type="filepath",
+                        )
+                        va_btn = gr.Button(
+                            "Analyser l'activite",
+                            variant="primary",
+                        )
+                        gr.Markdown("""
+                        **Legendes des couleurs :**
+                        - 🔵 Bleu = Echolocation
+                        - 🟢 Vert = Codas
+                        - 🔴 Rouge = Creaks (chasse)
+                        - ⚫ Gris = Silence
+
+                        **Astuce** : pour l'identification
+                        individuelle, utilisez l'onglet
+                        *Identifier un coda*.
+                        """)
+
+                    with gr.Column(scale=2):
+                        va_plot = gr.Plot(
+                            label="Timeline d'activite vocale",
+                        )
+                        va_results = gr.Markdown(
+                            "Uploadez un fichier audio puis cliquez sur **Analyser**."
+                        )
+
+                va_btn.click(
+                    fn=analyze_vocal_activity,
+                    inputs=[va_audio],
+                    outputs=[va_plot, va_results],
+                )
+
+            with gr.Tab("Zone d'etude"):
+                gr.Markdown("""
+                ### Ou vivent ces cachalots ?
+
+                Tous les enregistrements de cette application proviennent de la **Dominique**,
+                une petite ile volcanique des **Caraibes orientales** (15.4°N, 61.4°W).
+                Cette region abrite l'une des populations de cachalots les mieux etudiees
+                au monde, suivie depuis plus de 20 ans par le **Dominica Sperm Whale Project**
+                dirige par Shane Gero et Hal Whitehead.
+
+                Les cachalots de la Dominique vivent en **unites sociales matrilineaires**
+                (des familles de femelles et de jeunes) qui partagent un repertoire
+                de codas commun — un peu comme un dialecte regional.
+                """)
+
+                study_map = go.Figure()
+                study_map.add_trace(go.Scattergeo(
+                    lon=[-61.37],
+                    lat=[15.41],
+                    mode='markers+text',
+                    marker=dict(size=16, color='#00d4aa', symbol='circle',
+                                line=dict(width=2, color='white')),
+                    text=["Dominique"],
+                    textposition="top center",
+                    textfont=dict(size=14, color='white'),
+                    name="Zone d'etude",
+                ))
+                study_map.add_trace(go.Scattergeo(
+                    lon=[-61.37, -61.20, -61.55, -61.30, -61.45],
+                    lat=[15.41, 15.55, 15.30, 15.65, 15.20],
+                    mode='markers',
+                    marker=dict(size=8, color='#00d4aa', opacity=0.3, symbol='circle'),
+                    name="Zones d'observation",
+                    hoverinfo='skip',
+                ))
+                study_map.update_geos(
+                    center=dict(lon=-61.37, lat=15.41),
+                    projection_scale=80,
+                    showland=True,
+                    landcolor="#1a1a2e",
+                    showocean=True,
+                    oceancolor="#16213e",
+                    showcoastlines=True,
+                    coastlinecolor="#444",
+                    showframe=False,
+                    bgcolor="#0f0f23",
+                )
+                study_map.update_layout(
+                    title=dict(
+                        text="Zone d'etude — Dominique, Caraibes orientales",
+                        font=dict(size=16, color="#e0e0e0"),
+                    ),
+                    template="plotly_dark",
+                    paper_bgcolor="#0f0f23",
+                    height=500,
+                    margin=dict(l=0, r=0, t=50, b=0),
+                    legend=dict(bgcolor="rgba(0,0,0,0.5)", font=dict(size=11, color="#e0e0e0")),
+                    geo=dict(
+                        resolution=50,
+                        showlakes=False,
+                    ),
+                )
+                gr.Plot(value=study_map)
+
+                gr.Markdown("""
+                ---
+                **Pourquoi la Dominique ?**
+
+                Les eaux profondes au large de la cote ouest de la Dominique plongent
+                rapidement a plus de 1000 metres — l'habitat ideal des cachalots qui
+                chassent les calamars geants en profondeur. Cette proximite avec la cote
+                permet aux chercheurs d'observer et d'enregistrer les cachalots
+                presque quotidiennement.
+
+                **Donnees GPS** : les datasets utilises ici ne contiennent pas de
+                coordonnees GPS par enregistrement. Si des donnees georeferencees
+                deviennent disponibles, la carte s'enrichira automatiquement avec
+                les positions individuelles de chaque coda.
+                """)
+
+            with gr.Tab("Guide & Glossaire"):
+                gr.Markdown("""
+                ## Comprendre l'application
+
+                Cette page explique les concepts techniques utilises dans Whale Coda Explorer.
+                Pas besoin d'etre scientifique pour comprendre !
+
+                ---
+
+                ### Qu'est-ce qu'un coda ?
+
+                Un **coda** est une vocalisation sociale des cachalots. C'est une serie
+                de **clics** (comme des claquements) emis en rafale rapide.
+                Imaginez quelqu'un qui frappe sur une table avec un rythme precis :
+                *toc-toc-toc...toc-toc*. Chaque patron rythmique est un "type" de coda.
+
+                Les cachalots utilisent les codas pour **communiquer entre eux**,
+                un peu comme nous utilisons des mots ou des expressions.
+                Differentes familles de cachalots utilisent des repertoires
+                differents — comme des dialectes regionaux.
+
+                **Exemple** : un coda de type "1+1+3" ressemble a :
+                *clic — (pause) — clic — (pause) — clic-clic-clic* (rapide)
+
+                ---
+
+                ### Qu'est-ce que l'ICI ?
+
+                L'**ICI** (Inter-Click Interval) est le **temps entre deux clics consecutifs**
+                dans un coda, mesure en secondes. C'est le "rythme" du coda.
+
+                Un coda avec 5 clics a 4 ICI (les intervalles entre chaque paire de clics).
+                Ces intervalles forment un **patron rythmique** qui definit le type du coda.
+
+                > Pensez a la musique : deux morceaux peuvent avoir les memes notes
+                > mais un rythme different. C'est pareil pour les codas !
+
+                ---
+
+                ### Qu'est-ce que l'UMAP ?
+
+                **UMAP** (Uniform Manifold Approximation and Projection) est un algorithme
+                qui prend des donnees complexes et les **projette sur une carte 2D**
+                pour qu'on puisse les visualiser.
+
+                **Analogie** : imaginez que vous avez 620 recettes de cuisine, chacune
+                decrite par 10 ingredients et leurs proportions. C'est difficile
+                a visualiser en 10 dimensions ! L'UMAP prend ces 620 recettes et les
+                place sur une carte plate, de sorte que :
+                - Les recettes **similaires** sont **proches** sur la carte
+                - Les recettes **differentes** sont **eloignees**
+
+                Quand vous voyez le scatter plot (nuage de points), chaque point est un
+                coda. Les codas proches sur la carte ont des rythmes similaires.
+                Les groupes de points (clusters) representent des "types" de codas.
+
+                **Ce qui compte** : la **distance relative** entre les points,
+                pas leur position absolue. Les axes (UMAP 1, UMAP 2) n'ont pas
+                d'unite physique — ce sont des coordonnees abstraites.
+
+                ---
+
+                ### Qu'est-ce qu'un cluster ?
+
+                Un **cluster** est un **groupe de codas similaires** identifies
+                automatiquement par l'algorithme HDBSCAN. L'algorithme detecte les zones
+                denses du nuage de points (la ou beaucoup de codas se ressemblent)
+                et les regroupe.
+
+                - Chaque cluster a une **couleur** sur la carte
+                - Les points gris etiquetes "Bruit" sont des codas que l'algorithme
+                  n'a pas reussi a classer dans un groupe — ils sont trop atypiques
+                - Le nombre de clusters n'est **pas choisi a l'avance** :
+                  l'algorithme le determine tout seul
+
+                ---
+
+                ### Qu'est-ce que WhAM ?
+
+                **WhAM** (Whale Acoustics Model) est un modele d'intelligence artificielle
+                developpe par **Project CETI** (Cetacean Translation Initiative).
+                C'est un reseau de neurones de type *transformer* (la meme technologie
+                derriere ChatGPT et Claude) mais specialise dans l'audio des cachalots.
+
+                WhAM sait **encoder** un coda en un vecteur mathematique (une liste
+                de nombres) qui capture son "essence acoustique". C'est a partir
+                de ces vecteurs que l'UMAP construit la carte.
+
+                ---
+
+                ### Qu'est-ce que le TKEO ?
+
+                Le **TKEO** (Teager-Kaiser Energy Operator) est un outil mathematique
+                qui mesure l'**energie instantanee** d'un signal sonore.
+                Il permet de detecter les clics dans un enregistrement audio,
+                meme quand il y a du bruit de fond (vagues, moteurs, etc.).
+
+                Le detecteur de codas de l'application utilise le TKEO pour
+                reperer chaque clic, puis regroupe les clics proches en codas.
+
+                ---
+
+                ### Qu'est-ce qu'une unite sociale ?
+
+                Chez les cachalots, une **unite sociale** est une **famille elargie**
+                composee principalement de femelles adultes et de leurs petits.
+                Ces unites sont **matrilineaires** : les membres sont lies
+                par la lignee maternelle (meres, filles, soeurs, tantes).
+
+                Les unites sociales voyagent ensemble, chassent ensemble,
+                et partagent un **repertoire de codas** commun.
+                C'est un peu comme une famille qui partagerait un accent
+                ou des expressions propres.
+
+                Dans le dataset Gero, les unites sont identifiees par des lettres :
+                A, B, F, J, N, R, S, T, U.
+
+                ---
+
+                ### Le spectrogramme
+
+                Un **spectrogramme** est une image qui represente un son dans le temps.
+                - L'axe horizontal = le **temps** (en secondes)
+                - L'axe vertical = la **frequence** (grave en bas, aigu en haut)
+                - La couleur = l'**intensite** (plus c'est clair, plus c'est fort)
+
+                Sur un spectrogramme de coda, chaque clic apparait comme une
+                **ligne verticale** fine (car un clic contient toutes les frequences
+                d'un coup, comme un claquement de doigts).
+
+                ---
+
+                ### Glossaire rapide
+
+                | Terme | Definition simple |
+                |-------|------------------|
+                | **Coda** | Vocalisation sociale du cachalot : serie de clics rythmiques |
+                | **Clic** | Son bref et sec emis par le cachalot (comme un claquement) |
+                | **ICI** | Intervalle de temps entre deux clics consecutifs |
+                | **UMAP** | Algorithme qui cree une "carte" 2D a partir de donnees complexes |
+                | **Cluster** | Groupe de codas similaires detecte automatiquement |
+                | **HDBSCAN** | Algorithme de clustering base sur la densite |
+                | **WhAM** | Modele IA pour analyser l'audio des cachalots (Project CETI) |
+                | **TKEO** | Operateur mathematique pour detecter les clics dans le bruit |
+                | **Unite sociale** | Famille matrilineaire de cachalots |
+                | **Spectrogramme** | Image temps-frequence d'un son |
+                | **Embedding** | Representation numerique (vecteur) d'un coda |
+                | **Scatter plot** | Nuage de points ou chaque point = un coda |
+                | **SNR** | Signal-to-Noise Ratio — rapport signal/bruit en decibels |
+                | **Rubato** | Variation subtile de rythme dans un coda (comme en musique) |
+                | **DSWP** | Dominica Sperm Whale Project — projet d'etude de 20+ ans |
+                | **Project CETI** | Cetacean Translation Initiative — initiative de "traduction" |
+
+                ---
+
+                *Ce projet est developpe par Claude & Kevin dans le cadre de
+                [CivicDash](https://github.com/CivicDash) — outils open-source
+                pour rapprocher humains et nature.*
+                """)
+
         gr.Markdown("""
         ---
         <p style="text-align: center; color: #666; font-size: 0.85em;">
@@ -1237,5 +2126,6 @@ if __name__ == "__main__":
         .main-header h1 { font-size: 2em; margin-bottom: 5px; }
         .main-header p { color: #888; font-size: 0.95em; }
         """,
+        head=PLOTLY_CLICK_HEAD,
     )
     print("App lancee sur http://localhost:7860")
